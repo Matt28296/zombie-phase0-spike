@@ -96,3 +96,95 @@ two-player session is still the acceptance test.**
   server; remaining unverified items from the audit (§9): waystone coords,
   tree/rock exact coords, rock membership in old `blocked{}`, NPC collision,
   scales (17,15), possible further blocked tiles (e.g. house footprints).
+
+
+## Addendum — Phase 2: social systems, roles, progression (2026-11-16)
+
+**Code-verified only. No live playtest with real players has been done — Matt's
+live three-player session is still the acceptance test (spec §8 Phase 2).**
+
+### Files (all in `hidden_files/phase0-server/`, unless noted)
+- `server.js` — extended in place (Phase 1 base kept: 20 Hz tick, flow field,
+  delta snapshots, per-player event queues). +~700 lines: roles (6) +
+  signature abilities, squads, trust/marks/bounty, XP + level-up perk picks,
+  barricades + traps, attachments, crate weapon grants, death-pile weapon
+  drops, medkit heal channel, per-player noise + surge warning, extended
+  end screen. No protocol break: Phase 1 fields unchanged; Phase 2 adds
+  snapshot fields and message/event types.
+- `test-phase2.js` — 126 assertions (unit on `Session` + live WS smoke test
+  for the new message types).
+- `../phase2-protocol.md` — the client contract: every new message type
+  (exact JSON), every new snapshot field, every new event type.
+- `package.json` — added `npm run test:phase2`.
+
+### Test results
+- `node --check` on `server.js`, `test-phase2.js`: all pass.
+- `node test-phase2.js`: **run=126, passed=126, failed=0** (first green run).
+- `node test-phase1.js`: **83/84** — the single failure is the same
+  pre-existing flaky `every zombie reaches a stationary player` test (it
+  passed 84/84 on one of four runs of the new code, 83/84 on the others —
+  it flips run-to-run, not a regression; the Phase 1 report documents it
+  failing 6/8 on the original code).
+- `node test-two-clients.js`: **PASS, 0 failed** (8/8).
+- `node test-events-two-clients.js`: **PASS, run=11, passed=11**.
+
+### PASS/FAIL per job area
+| Job | Verdict | Notes |
+|---|---|---|
+| 2.1 Squads | PASS | Invite/accept/decline/leave, cap 4 (5th refused), leader reassignment on leave, shared waypoints (member-only in snapshot), leader-only loot toggle, squad kill feed, cross-squad revive allowed |
+| 2.2 Trust/marks/bounty | PASS | Gains (revive +8, cross-squad +12, share +5, shared kill +2, wave survived +3), losses (damage −1/−2 by pattern, kill −20, execute −30, loot-after-kill −5), mark thresholds (Suspect −10, Traitor −31), bounty 10+5×kills with payout + event, mark clears on rebuild |
+| 2.3 Roles | PASS | All 6 loadouts + passives measured (Heavy 125 HP / ×0.9 speed, Scout ×1.1, Sharpshooter 15% crit / +25% headshot, Medic 3 meds cap 5, Engineer cap 4 barricades); all 6 abilities fire + cooldown + measured effect (Rally +15% dmg, Bulwark frontal ×0.6, Longshot guaranteed crit 90, Skydance 0.6 s dash, Triage 0.8 s revive + aura, Fortify free barricade) |
+| 2.4 Perks/barricades/traps/attachments | PASS | XP values + elite ×2, level-up at 50 XP with 3 choices, all 7 perks apply (damage 28 vs 25 measured, hp 115, reload 960 ms, barricade cap 3, ammo +25%, revive ×0.75, quiet −25% noise); barricade build (2 s / Engineer 1 s), 60 HP, zombie attacks + breaks with event, capacity enforced; spike 20 dmg / molotov 10 dps / noise +20 attention + lure all trigger; scope/extended-mag/grip stats measured |
+| 2.5 Revive ladder / execute / noise | PASS | Revive times measured (base 3 s, squadmate 2 s live, Medic 1.5 s, Triage 0.8 s, revive perk ×0.75); execute −30 + `player-executed`; per-player noise 0–100 + decay; `surge-warning` at attention 35; quiet pacing stays below the warning threshold where loud pacing trips it |
+| 2.6 End screen | PASS | All 16 per-player fields present (waves, kills, headshots, revives, betrayals, loot, damage, times downed, trust + rank, XP, level, role, squadId); titles Last One Standing / Most Revives / Most Betrayals computed |
+| Weapon-grant path (blocks roles) | PASS | Crate grants a missing weapon (35% roll, stubbed-random verified) and attachments; death pile drops owned weapons beyond pistol+melee (Heavy shotgun drops + is lootable); roles start with their weapon |
+
+### Phase 1 defects found and fixed (by the Phase 2 work)
+- **`shot` event / `hit.damage` reported pre-mitigation damage:** Bulwark
+  reduced the HP lost but the shot event still reported the full 25, so the
+  client would have shown a damage number the target never took.
+  `damagePlayer` now returns the damage actually dealt (0 if dodged,
+  Bulwark-reduced otherwise) and `shootAt` reports that in the hit object,
+  the `shot` event, and `damageDealt`. No Phase 1 test depended on the old
+  reporting (all Phase 1 suites still pass).
+- **Movement-validation bound vs Skydance:** the `impossible-speed` check
+  used a fixed 12 u/s dodge cap, but a Scout Skydance dash reaches ~28.5
+  u/s (12 × 1.8 × 1.1 × 1.2) plus velocity decay — the dash would have
+  tripped the check and reset the player's position mid-dash. The bound is
+  now an absolute 30 u/s cap (still catches gross simulation errors; the
+  server is authoritative, so clients can't set positions anyway).
+- **Heal channel off-by-one:** the expiry tick swallowed the last 1 HP, so
+  a medkit healed 39 HP instead of 40. The heal now applies before the
+  expiry check (40 HP over 2 s, verified).
+- **Last One Standing tie-break:** deaths in the same tick shared a
+  `deathMs`, so the title pick was insertion order, not death order. Kills
+  now carry a monotonic `deathSeq` and the title uses it.
+
+### Simplifications vs spec (Matt's filter — see phase2-protocol.md §13)
+- Shared loot: single toggle, no distribution UI; weapons/attachments
+  never split (picker only). Split rule is documented exactly.
+- Accident-vs-deliberate: simple 10 s pattern heuristic (first hit + zombie
+  near = −1, else −2). Stated as not a perfect judge.
+- Attachments auto-apply, one slot per weapon, no management UI.
+- Barricades: surveyed points only; zombies attack within 1.5 tiles (no
+  flow-field blocking).
+- Death-pile weapons: "non-starting" = beyond the universal pistol+melee,
+  so role starting weapons (Heavy shotgun, etc.) DO drop — per the task's
+  parenthetical ("killing a Heavy can yield their shotgun").
+- Kill (−20) attribution: a downer owns a bleed-out / zombie-finish death,
+  since in this engine a player kill otherwise only ever happens via
+  execute (−30).
+- Cross-squad revive +12 covers any non-same-squad revive (including two
+  solos); same squad is +8.
+- Triage aura heals squadmates only (solo Medic gets no self-heal from it);
+  Rally also buffs the Leader themself; Bulwark applies to zombie damage too.
+
+### Could NOT verify (needs live play)
+- Everything in the Phase 1 "could NOT verify" list still stands, plus:
+  three real players in one session forming a squad, betraying, and claiming
+  a bounty (the acceptance check); whether the trust numbers feel right in
+  a real firefight (the −1/−2 heuristic will misread some accidents);
+  barricade/trap feel at the surveyed points; perk-pick strip usability
+  mid-fight (client-side).
+- **Live Render service still runs the pre-Phase-2 build — needs the manual
+  redeploy trigger (parent triggers it; report the commit SHA).**
