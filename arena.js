@@ -1,110 +1,167 @@
 // arena.js — Gate Town arena data for the zombie Survival server.
 // ---------------------------------------------------------------------------
-// ASSUMED GEOMETRY — MUST BE VERIFIED AGAINST THE REAL GATE TOWN REGION.
-// Everything below is derived from the design spec §2.3 (plaza, houses, market
-// stall, gatehouse, walls) and the 60x60 world grid — NOT from a measured
-// read of the live Gate Town tiles. A separate arena-audit job must verify /
-// refine: the exact wall line, house footprints, gate positions, spawn points
-// and the extraction point against the real region before live play.
-// Until that audit lands, treat every coordinate here as a placeholder that
-// is internally consistent (bounds hold, gates sit outside the boundary,
-// spawns are spread apart) but not as ground truth about Gate Town.
+// VERIFIED GEOMETRY — merged 2026-11-16 from the arena audit (Job 1.3).
+// Source of truth: hidden_files/arena-definition.json (audit of the live
+// Gate Town region in artifact soft-yeti-mmorpg, index.html, 23,586 lines).
+// Verification: hidden_files/arena-verify.js — 227 checks, 227 passed.
+// Coordinate system: 60x60 tile grid; 1 tile = 1 unit; continuous coords
+// 0..60, tile (tx,ty) spans [tx,tx+1) x [ty,ty+1); tile centre = (tx+0.5,
+// ty+0.5). (Old-game wpos(x,z) = (x-30+0.5, z-30+0.5) is a centred frame;
+// the server uses tile-index space directly.)
+//
+// Arena = south half of Gate Town: bounds rect tiles x 0..29, z 14..29
+// (continuous x 0..30, y 14..30). The north strip (z 0..13: sand corner,
+// farm patch) is zombie staging, NOT playable. Wall rows z=10/z=13
+// (x=11..16, gap at x=13,14) form the north boundary; the gap is the
+// front door — zombies enter through it, players cannot walk north
+// through it (outside the player rect).
+//
+// Unverified items carried over from the audit (see arena-audit.md §9):
+// waystone coords unknown (not placed); tree/rock exact coords unknown
+// (decorative, not collision); rock corner membership in the old blocked{}
+// set not explicitly confirmed (blocked here per task direction);
+// NPC collision unverified (NPCs absent in zombie mode, tiles walkable);
+// old "scales" at (17,15) has no matching prop (not placed); house
+// footprints were not in the inspection — if more blocked tiles are ever
+// found, add them to buildBlockedSet() and re-run arena-verify.js.
 // ---------------------------------------------------------------------------
 'use strict';
 
 const SIZE = 60; // 60x60 tile grid, coords 0..60 (continuous), tiles 0..59
 
-// Playable bounds (continuous coords). Players and zombies are clamped here;
-// zombie spawn gates sit OUTSIDE this rectangle.
-const BOUNDS = { minX: 2, minY: 2, maxX: 58, maxY: 58 };
+// Playable bounds for PLAYERS (continuous coords). Players are hard-clamped
+// here; they may not step onto the gate-gap tiles (13,13)/(14,13), which sit
+// at y 13..14, north of minY=14.
+const BOUNDS = { minX: 0, minY: 14, maxX: 30, maxY: 30 };
 
-// Blocked rectangles (houses / stalls / gatehouse walls) in tile coords.
-// Format: {x, y, w, h, name}. Flow field treats these tiles as impassable;
-// movement collision clamps players/zombies out of them (circle-vs-rect).
-// ASSUMED — verify against real Gate Town geometry.
-const BLOCKERS = [
-  { x: 8,  y: 8,  w: 6, h: 5, name: 'house-nw' },
-  { x: 46, y: 8,  w: 6, h: 5, name: 'house-ne' },
-  { x: 8,  y: 47, w: 6, h: 5, name: 'house-sw' },
-  { x: 46, y: 47, w: 6, h: 5, name: 'house-se' },
-  { x: 14, y: 26, w: 5, h: 4, name: 'market-stall' },
-  { x: 41, y: 26, w: 5, h: 4, name: 'market-stall-2' },
-  { x: 27, y: 4,  w: 6, h: 3, name: 'gatehouse' },
-  { x: 27, y: 53, w: 6, h: 3, name: 'south-wall-house' },
-];
+// Zombies are NOT rect-bounded: they use the full 60x60 grid minus the
+// blocked set and enter via the four spawn gates (some outside the rect).
+const ZOMBIE_BOUNDS = { minX: 0, minY: 0, maxX: SIZE, maxY: SIZE };
 
-// Zombie spawn gates — outside the playable boundary, one per side.
-// ASSUMED positions; audit must confirm real gate openings in the wall line.
+// ---- Blocked tiles (153) — built from the audited regions ----
+// Wall rows z=10 and z=13, x=11,12,15,16 (gap at x=13,14): 8 tiles.
+// Pond (water): x<=8 and z>=21: 9 x 9 = 81 tiles.
+// Rock corner: x>=22 and z>=22: 8 x 8 = 64 tiles.
+// Total 8 + 81 + 64 = 153. (Water is blocked per the old isBlocked rule;
+// rock is blocked per the audit's task direction — see header note.)
+function buildBlockedSet() {
+  const s = new Set();
+  const add = (tx, ty) => s.add(`${tx},${ty}`);
+  for (const wx of [11, 12, 15, 16]) { add(wx, 10); add(wx, 13); }
+  for (let tx = 0; tx <= 8; tx++) for (let ty = 21; ty <= 29; ty++) add(tx, ty);
+  for (let tx = 22; tx <= 29; tx++) for (let ty = 22; ty <= 29; ty++) add(tx, ty);
+  return s;
+}
+const BLOCKED_TILES = buildBlockedSet();
+const BLOCKED_COUNT = BLOCKED_TILES.size; // 153 — asserted by test-phase1.js
+
+// Zombie spawn gates. Wave 1 uses gates[0] only, wave 2 the first two,
+// wave 3+ all four (server.js slices by waveDef().gates). Main gate has
+// two spawn tiles (the 2-wide gap); spawnZombie picks one at random.
+// West gate sits ON the west boundary (x=-1 is off-grid) — the one
+// stated exception to "gates sit outside the bounds".
 const GATES = [
-  { id: 'gate-north', x: 30, y: 0.5, dir: 'south' },
-  { id: 'gate-south', x: 30, y: 59.5, dir: 'north' },
-  { id: 'gate-west',  x: 0.5, y: 30, dir: 'east' },
-  { id: 'gate-east',  x: 59.5, y: 30, dir: 'west' },
+  {
+    id: 'gate-main', name: 'Main gate (gatehouse gap)',
+    x: 14, y: 12.5, dir: 'south',
+    tiles: [{ x: 13.5, y: 12.5 }, { x: 14.5, y: 12.5 }],
+  },
+  { id: 'gate-west', name: 'West gate (world edge)', x: 0.5, y: 18.5, dir: 'east', onBoundary: true },
+  { id: 'gate-east', name: 'East gate (desert edge)', x: 30.5, y: 20.5, dir: 'west' },
+  { id: 'gate-south', name: 'South gate (coast edge)', x: 20.5, y: 30.5, dir: 'north' },
 ];
 
-// Player drop-in points, spread apart around the central plaza.
-// ASSUMED — audit must confirm they are not inside a house or wall.
+// Player drop-in points (tile centres), spread around the plaza holdout.
+// spawn-1 is the old-game spawn tile (15,19). Min pairwise distance 3.16
+// tiles (plaza corners) — close by design; the 10 s grace keeps the
+// opening fair, not distance alone (see arena-audit.md §4/§5).
 const PLAYER_SPAWNS = [
-  { x: 30, y: 30 }, { x: 24, y: 30 }, { x: 36, y: 30 }, { x: 30, y: 24 },
-  { x: 30, y: 36 }, { x: 24, y: 24 }, { x: 36, y: 36 }, { x: 24, y: 36 },
+  { id: 'spawn-1', x: 15.5, y: 19.5 },
+  { id: 'spawn-2', x: 12.5, y: 18.5 },
+  { id: 'spawn-3', x: 18.5, y: 18.5 },
+  { id: 'spawn-4', x: 9.5, y: 21.5 },
+  { id: 'spawn-5', x: 21.5, y: 23.5 },
+  { id: 'spawn-6', x: 15.5, y: 26.5 },
 ];
 
 // Barricade chokepoints (surveyed only — placement itself is Phase 2).
-// Each sits on a real route into the plaza. ASSUMED — verify reachability.
+// Honest finding (arena-audit.md §6): only the gate gap seals a route
+// (main-gate -> plaza 6 tiles open, 10 barricaded). The three plaza-entry
+// points are single tiles in open ground: delay/cover, not seals.
 const BARRICADE_POINTS = [
-  { id: 'bp-north', x: 30, y: 10 },
-  { id: 'bp-south', x: 30, y: 50 },
-  { id: 'bp-west',  x: 10, y: 30 },
-  { id: 'bp-east',  x: 50, y: 30 },
-  { id: 'bp-plaza-nw', x: 20, y: 20 },
-  { id: 'bp-plaza-se', x: 40, y: 40 },
+  {
+    id: 'barricade-1', name: 'Gate gap', x: 14, y: 13.5,
+    tiles: [{ x: 13.5, y: 13.5 }, { x: 14.5, y: 13.5 }],
+    designatedGate: 'gate-main',
+  },
+  { id: 'barricade-2', name: 'Plaza west entry', x: 12.5, y: 16.5, tiles: [{ x: 12.5, y: 16.5 }], designatedGate: 'gate-west' },
+  { id: 'barricade-3', name: 'Plaza east entry', x: 18.5, y: 16.5, tiles: [{ x: 18.5, y: 16.5 }], designatedGate: 'gate-east' },
+  { id: 'barricade-4', name: 'Plaza south entry', x: 15.5, y: 20.5, tiles: [{ x: 15.5, y: 20.5 }], designatedGate: 'gate-south' },
 ];
 
-// Loot crate positions (scavenge loop). ASSUMED — verify against real props.
+// Loot crate positions (scavenge loop) — spread so the loop pulls players
+// off the plaza in every direction. All on walkable in-bounds tiles.
 const LOOT_CRATES = [
-  { id: 'crate-1', x: 20, y: 20 }, { id: 'crate-2', x: 40, y: 20 },
-  { id: 'crate-3', x: 20, y: 40 }, { id: 'crate-4', x: 40, y: 40 },
-  { id: 'crate-5', x: 30, y: 14 }, { id: 'crate-6', x: 14, y: 30 },
+  { id: 'crate-1', x: 11.5, y: 17.5, zone: 'plaza-west' },
+  { id: 'crate-2', x: 19.5, y: 16.5, zone: 'plaza-east' },
+  { id: 'crate-3', x: 14.5, y: 22.5, zone: 'south-center' },
+  { id: 'crate-4', x: 9.5, y: 19.5, zone: 'west / pond edge' },
+  { id: 'crate-5', x: 21.5, y: 19.5, zone: 'east-center' },
+  { id: 'crate-6', x: 12.5, y: 25.5, zone: 'southwest' },
+  { id: 'crate-7', x: 19.5, y: 26.5, zone: 'southeast' },
+  { id: 'crate-8', x: 24.5, y: 17.5, zone: 'far east' },
+  { id: 'crate-9', x: 6.5, y: 16.5, zone: 'far west' },
+  { id: 'crate-10', x: 16.5, y: 28.5, zone: 'far south' },
 ];
 
-// Extraction point — opens after wave 5. At the gatehouse (north).
-// ASSUMED — audit must confirm the gatehouse is a sensible extraction site.
-const EXTRACTION_POINT = { x: 30, y: 9 }; // just south of the gatehouse (not inside it)
+// Extraction point — opens after wave 5. Far south-center on the dirt
+// column x=15, at the coast edge: extraction is a run, not a camp.
+// Inert before wave 5 (no interaction, no lit marker).
+const EXTRACTION_POINT = { x: 15.5, y: 28.5, tile: [15, 28], opensAfterWave: 5, name: 'South extraction' };
 
-const MIN_SPAWN_DISTANCE = 12; // zombies never spawn within this of a player
+// Minimum zombie spawn distance from any player spawn (audit §4: 6 tiles
+// Euclidean; closest actual pair 6.08 — main gate -> spawn-2).
+const MIN_SPAWN_DISTANCE = 6;
 
 function tileBlocked(tx, ty) {
   if (tx < 0 || ty < 0 || tx >= SIZE || ty >= SIZE) return true;
-  for (const b of BLOCKERS) {
-    if (tx >= b.x && tx < b.x + b.w && ty >= b.y && ty < b.y + b.h) return true;
-  }
-  return false;
+  return BLOCKED_TILES.has(`${tx},${ty}`);
 }
 
-// Circle-vs-blocker collision: push a point (x,y,r) out of blocked rects.
+// Circle-vs-blocked-tile collision: push a point (x,y,r) out of blocked
+// tiles. Two passes so corners resolve. Centre exactly on a tile edge or
+// corner (or inside a tile): push out along the CLOSEST edge (min
+// penetration). Ties break toward the south edge first, so a zombie
+// walking east along a south edge is pushed south (clear of the wall)
+// instead of back west forever (the wall-slide fix from Phase 1).
 function resolveCollision(x, y, r) {
-  for (const b of BLOCKERS) {
-    const cx = Math.max(b.x, Math.min(x, b.x + b.w));
-    const cy = Math.max(b.y, Math.min(y, b.y + b.h));
-    const dx = x - cx, dy = y - cy;
-    const d2 = dx * dx + dy * dy;
-    if (d2 < r * r) {
-      if (d2 > 1e-9) {
-        const d = Math.sqrt(d2);
-        x = cx + (dx / d) * r; y = cy + (dy / d) * r;
-      } else {
-        // Centre exactly on an edge/corner: push out along the CLOSEST
-        // edge (min penetration). Ties break toward the south/north edges
-        // first, so a zombie walking east along a south edge is pushed
-        // south (clear of the wall) instead of back west forever.
-        const pl = x - b.x, pr = b.x + b.w - x, pt = y - b.y, pb = b.y + b.h - y;
-        const m = Math.min(pl, pr, pt, pb);
-        if (m === pb) y = b.y + b.h + r;
-        else if (m === pt) y = b.y - r;
-        else if (m === pl) x = b.x - r;
-        else x = b.x + b.w + r;
+  for (let pass = 0; pass < 2; pass++) {
+    let pushed = false;
+    const x0 = Math.floor(x - r), x1 = Math.floor(x + r);
+    const y0 = Math.floor(y - r), y1 = Math.floor(y + r);
+    for (let ty = y0; ty <= y1; ty++) {
+      for (let tx = x0; tx <= x1; tx++) {
+        if (!tileBlocked(tx, ty)) continue;
+        const cx = Math.max(tx, Math.min(x, tx + 1));
+        const cy = Math.max(ty, Math.min(y, ty + 1));
+        const dx = x - cx, dy = y - cy;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= r * r) continue;
+        if (d2 > 1e-9) {
+          const d = Math.sqrt(d2);
+          x = cx + (dx / d) * r; y = cy + (dy / d) * r;
+        } else {
+          const pl = x - tx, pr = tx + 1 - x, pt = y - ty, pb = ty + 1 - y;
+          const m = Math.min(pl, pr, pt, pb);
+          if (m === pb) y = ty + 1 + r;
+          else if (m === pt) y = ty - r;
+          else if (m === pl) x = tx - r;
+          else x = tx + 1 + r;
+        }
+        pushed = true;
       }
     }
+    if (!pushed) break;
   }
   return { x, y };
 }
@@ -128,9 +185,11 @@ function hasLineOfSight(x0, y0, x1, y1) {
 }
 
 module.exports = {
-  SIZE, BOUNDS, BLOCKERS, GATES, PLAYER_SPAWNS, BARRICADE_POINTS,
+  SIZE, BOUNDS, ZOMBIE_BOUNDS, BLOCKED_TILES, BLOCKED_COUNT,
+  GATES, PLAYER_SPAWNS, BARRICADE_POINTS,
   LOOT_CRATES, EXTRACTION_POINT, MIN_SPAWN_DISTANCE,
   tileBlocked, resolveCollision, hasLineOfSight,
-  ASSUMED_GEOMETRY: true,
-  ASSUMED_NOTE: 'All geometry in this module is ASSUMED from design spec §2.3 and must be verified against the real Gate Town region by the arena-audit job.',
+  ASSUMED_GEOMETRY: false,
+  VERIFIED_GEOMETRY: true,
+  VERIFIED_NOTE: 'Geometry verified 2026-11-16 by the arena audit (Job 1.3) against the live Gate Town region; see arena-definition.json + arena-audit.md. 227/227 arena-verify.js checks pass.',
 };

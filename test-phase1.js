@@ -403,16 +403,37 @@ function unitTests() {
     const on = s.snapshotFor(p).zombies.length;
     return off === 0 && on === 1;
   })());
-  check('arena geometry is flagged ASSUMED (audit pending)', arena.ASSUMED_GEOMETRY === true);
-  check('arena gates sit outside the playable bounds', arena.GATES.every(g => g.x < arena.BOUNDS.minX || g.x > arena.BOUNDS.maxX || g.y < arena.BOUNDS.minY || g.y > arena.BOUNDS.maxY));
-  check('player spawns are spread apart (min 5 tiles)', (() => {
+  check('arena geometry is VERIFIED (audit Job 1.3 merged, no longer assumed)',
+    arena.VERIFIED_GEOMETRY === true && arena.ASSUMED_GEOMETRY === false);
+  check('arena bounds rect is the audited south-half Gate Town (x 0..30, y 14..30)',
+    arena.BOUNDS.minX === 0 && arena.BOUNDS.minY === 14 && arena.BOUNDS.maxX === 30 && arena.BOUNDS.maxY === 30);
+  check('arena blocked set is the audited 153 tiles (8 wall + 81 pond + 64 rock)',
+    arena.BLOCKED_COUNT === 153 && arena.tileBlocked(11, 10) && arena.tileBlocked(0, 21) && arena.tileBlocked(22, 22)
+    && !arena.tileBlocked(13, 13) && !arena.tileBlocked(14, 13) && !arena.tileBlocked(15, 19));
+  check('arena gates sit outside the playable bounds (west gate is the stated on-boundary exception)',
+    arena.GATES.every(g => g.onBoundary || g.x < arena.BOUNDS.minX || g.x > arena.BOUNDS.maxX || g.y < arena.BOUNDS.minY || g.y > arena.BOUNDS.maxY));
+  check('arena gates: main first (wave 1), west second (wave 2), 4 total (wave 3+)',
+    arena.GATES.length === 4 && arena.GATES[0].id === 'gate-main' && arena.GATES[1].id === 'gate-west');
+  check('player spawns are spread apart (min 3 tiles — audited plaza layout, closest 3.16)', (() => {
     const sp = arena.PLAYER_SPAWNS;
     for (let i = 0; i < sp.length; i++) for (let j = i + 1; j < sp.length; j++)
-      if (Math.hypot(sp[i].x - sp[j].x, sp[i].y - sp[j].y) < 5) return false;
+      if (Math.hypot(sp[i].x - sp[j].x, sp[i].y - sp[j].y) < 3) return false;
+    return true;
+  })());
+  check('player spawns are all on walkable tiles and >= 6 tiles from every gate tile', (() => {
+    const gateTiles = [];
+    for (const g of arena.GATES) (g.tiles || [{ x: g.x, y: g.y }]).forEach(t => gateTiles.push(t));
+    for (const sp of arena.PLAYER_SPAWNS) {
+      if (arena.tileBlocked(Math.floor(sp.x), Math.floor(sp.y))) return false;
+      for (const gt of gateTiles) if (Math.hypot(sp.x - gt.x, sp.y - gt.y) < 6) return false;
+    }
     return true;
   })());
   check('arena has barricade points, loot crates, extraction point',
     arena.BARRICADE_POINTS.length >= 4 && arena.LOOT_CRATES.length >= 4 && !!arena.EXTRACTION_POINT);
+  check('arena has exactly 10 loot crates and extraction at (15.5, 28.5) opening after wave 5',
+    arena.LOOT_CRATES.length === 10 && arena.EXTRACTION_POINT.x === 15.5 && arena.EXTRACTION_POINT.y === 28.5
+    && arena.EXTRACTION_POINT.opensAfterWave === 5);
 }
 
 // ---------------- Live WS integration tests ----------------

@@ -273,9 +273,16 @@ class Session {
     const id = `z${nextZombieId++}`;
     const gates = this.activeGates || arena.GATES;
     const g = gate || gates[Math.floor(Math.random() * gates.length)] || arena.GATES[0];
+    // A gate may define several spawn tiles (main gate = 2-wide gap):
+    // pick one at random so zombies spread across the opening.
+    let gx = g.x, gy = g.y;
+    if (g.tiles && g.tiles.length) {
+      const t = g.tiles[Math.floor(Math.random() * g.tiles.length)];
+      gx = t.x; gy = t.y;
+    }
     // Minimum spawn distance from any player (fairness, §5.1).
     const z = {
-      id, type, elite, x: g.x, y: g.y, hp, maxHp: hp,
+      id, type, elite, x: gx, y: gy, hp, maxHp: hp,
       speed: base.speed * (affix ? affix.speedMul : 1),
       damage: base.damage * (affix && affix.dmgMul ? affix.dmgMul : 1),
       state: 'chase', windupUntil: 0, attackTarget: null, screamUntil: 0, screamed: false,
@@ -658,8 +665,8 @@ class Session {
         }
       }
       }
-      z.x = clamp(z.x, arena.BOUNDS.minX, arena.BOUNDS.maxX);
-      z.y = clamp(z.y, arena.BOUNDS.minY, arena.BOUNDS.maxY);
+      z.x = clamp(z.x, arena.ZOMBIE_BOUNDS.minX, arena.ZOMBIE_BOUNDS.maxX);
+      z.y = clamp(z.y, arena.ZOMBIE_BOUNDS.minY, arena.ZOMBIE_BOUNDS.maxY);
       const c = arena.resolveCollision(z.x, z.y, 0.4);
       z.x = c.x; z.y = c.y;
       // Stuck detection: a zombie walking exactly along a wall edge can be
