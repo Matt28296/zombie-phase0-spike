@@ -306,39 +306,43 @@ function dist(ax, ay, bx, by) { return Math.hypot(ax - bx, ay - by); }
 
 // ---- Flow field: ONE multi-source BFS pass per player cluster, ~2 Hz ----
 // dir[ty*60+tx] = unit step {dx,dy} toward nearest living player, or null.
+// Hot path: the queue is a typed array and blocked-ness comes from the
+// precomputed arena.BLOCKED_GRID, so a recompute allocates nothing per
+// tile (the old version built a template string per tileBlocked() call
+// and four arrays per neighbour loop — ~29k string allocs + ~14k array
+// allocs per BFS on the 60x60 grid, 14 ms median / 87 ms max on this
+// VM). BFS visit order and the direction tie-break (first neighbour in
+// +x,-x,+y,-y order with a strictly smaller distance) are unchanged,
+// so the field itself is identical to the old code's output.
 function computeFlowField(targets) {
   const W = arena.SIZE;
+  const blocked = arena.BLOCKED_GRID;
   const distGrid = new Int16Array(W * W).fill(-1);
   const dir = new Array(W * W).fill(null);
-  const q = [];
+  const q = new Int32Array(W * W); // every tile enqueued at most once
+  let qHead = 0, qTail = 0;
   for (const t of targets) {
     const tx = clamp(Math.floor(t.x), 0, W - 1), ty = clamp(Math.floor(t.y), 0, W - 1);
     const i = ty * W + tx;
-    if (distGrid[i] === -1 && !arena.tileBlocked(tx, ty)) { distGrid[i] = 0; q.push(i); }
+    if (distGrid[i] === -1 && !blocked[i]) { distGrid[i] = 0; q[qTail++] = i; }
   }
-  let head = 0;
-  while (head < q.length) {
-    const cur = q[head++], cx = cur % W, cy = Math.floor(cur / W);
+  while (qHead < qTail) {
+    const cur = q[qHead++], cx = cur % W, cy = (cur / W) | 0;
     const nd = distGrid[cur] + 1;
-    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      const nx = cx + dx, ny = cy + dy;
-      if (nx < 0 || ny < 0 || nx >= W || ny >= W) continue;
-      const ni = ny * W + nx;
-      if (distGrid[ni] !== -1 || arena.tileBlocked(nx, ny)) continue;
-      distGrid[ni] = nd; q.push(ni);
-    }
+    if (cx + 1 < W) { const ni = cur + 1; if (distGrid[ni] === -1 && !blocked[ni]) { distGrid[ni] = nd; q[qTail++] = ni; } }
+    if (cx > 0) { const ni = cur - 1; if (distGrid[ni] === -1 && !blocked[ni]) { distGrid[ni] = nd; q[qTail++] = ni; } }
+    if (cy + 1 < W) { const ni = cur + W; if (distGrid[ni] === -1 && !blocked[ni]) { distGrid[ni] = nd; q[qTail++] = ni; } }
+    if (cy > 0) { const ni = cur - W; if (distGrid[ni] === -1 && !blocked[ni]) { distGrid[ni] = nd; q[qTail++] = ni; } }
   }
   // Direction per tile = step to the neighbour with the smallest distance.
   for (let ty = 0; ty < W; ty++) for (let tx = 0; tx < W; tx++) {
     const i = ty * W + tx;
-    if (distGrid[i] <= 0 || arena.tileBlocked(tx, ty)) continue;
+    if (distGrid[i] <= 0 || blocked[i]) continue;
     let best = null, bestD = distGrid[i];
-    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      const nx = tx + dx, ny = ty + dy;
-      if (nx < 0 || ny < 0 || nx >= W || ny >= W) continue;
-      const d = distGrid[ny * W + nx];
-      if (d !== -1 && d < bestD) { bestD = d; best = { dx, dy }; }
-    }
+    if (tx + 1 < W) { const d = distGrid[i + 1]; if (d !== -1 && d < bestD) { bestD = d; best = { dx: 1, dy: 0 }; } }
+    if (tx > 0) { const d = distGrid[i - 1]; if (d !== -1 && d < bestD) { bestD = d; best = { dx: -1, dy: 0 }; } }
+    if (ty + 1 < W) { const d = distGrid[i + W]; if (d !== -1 && d < bestD) { bestD = d; best = { dx: 0, dy: 1 }; } }
+    if (ty > 0) { const d = distGrid[i - W]; if (d !== -1 && d < bestD) { bestD = d; best = { dx: 0, dy: -1 }; } }
     dir[i] = best;
   }
   return { dir, distGrid };
@@ -2333,8 +2337,32 @@ wss.on('connection', (ws) => {
   ws.on('error', (err) => console.error('[ws error]', err.message));
 });
 
+// Tick scheduler: a plain setInterval(TICK_MS) fires late on a loaded or
+// throttled host — measured ~85-90 ms per fire on this VM, i.e. 11-14
+// ticks/s against a 15-25 threshold — and every late fire permanently
+// loses game time. Instead the scheduler tracks wall-clock drift: each
+// fire runs as many 50 ms ticks as have elapsed (capped, so a stall can
+// never spiral into a burst), and resyncs if it fell too far behind.
+// On a healthy host this fires exactly once per 50 ms — identical to
+// setInterval. The simulation itself is unchanged: same 50 ms steps,
+// same order, same per-tick work; only the driver is drift-correcting.
+const MAX_CATCHUP_TICKS = 5; // 250 ms of sim per fire, then resync
+let nextTickAt = 0;
+function scheduleTick() {
+  const now = Date.now();
+  if (nextTickAt === 0) nextTickAt = now;
+  let n = 0;
+  while (nextTickAt <= now && n < MAX_CATCHUP_TICKS) {
+    globalTick();
+    nextTickAt += TICK_MS;
+    n++;
+  }
+  if (nextTickAt <= now) nextTickAt = now + TICK_MS; // fell too far behind: resync, don't burst
+  setTimeout(scheduleTick, Math.max(0, nextTickAt - Date.now()));
+}
+
 if (require.main === module) {
-  setInterval(globalTick, TICK_MS);
+  scheduleTick();
   server.listen(PORT, () => console.log(`phase2 server listening on :${PORT} (tick ${1000 / TICK_MS} Hz, arena ${arena.SIZE}x${arena.SIZE}, zombie cap ${ZOMBIE_CAP})`));
 }
 

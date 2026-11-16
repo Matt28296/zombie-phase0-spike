@@ -59,6 +59,22 @@ function buildBlockedSet() {
 const BLOCKED_TILES = buildBlockedSet();
 const BLOCKED_COUNT = BLOCKED_TILES.size; // 145 — asserted by test-phase1.js
 
+// Precomputed blocked lookup: BLOCKED_GRID[ty*SIZE+tx] === 1 when blocked.
+// The flow-field BFS reads blocked-ness ~29k times per recompute; the
+// Set+string form (tileBlocked) allocates a template string per call and
+// was the single biggest per-BFS cost on the expanded 60x60 grid.
+// tileBlocked() stays the public API (collision / line-of-sight); this
+// grid is the hot-path form. Built once at load — the blocked set never
+// changes at runtime.
+const BLOCKED_GRID = (() => {
+  const g = new Uint8Array(SIZE * SIZE);
+  for (const k of BLOCKED_TILES) {
+    const sep = k.indexOf(',');
+    g[Number(k.slice(sep + 1)) * SIZE + Number(k.slice(0, sep))] = 1;
+  }
+  return g;
+})();
+
 // Zombie spawn gates — all four now sit on the town's PERIMETER (the
 // old main gate at y=12.5 was inside the expanded town and had to move).
 // Wave 1 uses gates[0] only, wave 2 the first two, wave 3+ all four
@@ -212,7 +228,7 @@ function hasLineOfSight(x0, y0, x1, y1) {
 }
 
 module.exports = {
-  SIZE, BOUNDS, ZOMBIE_BOUNDS, BLOCKED_TILES, BLOCKED_COUNT,
+  SIZE, BOUNDS, ZOMBIE_BOUNDS, BLOCKED_TILES, BLOCKED_COUNT, BLOCKED_GRID,
   GATES, PLAYER_SPAWNS, BARRICADE_POINTS,
   LOOT_CRATES, EXTRACTION_POINT, MIN_SPAWN_DISTANCE,
   tileBlocked, resolveCollision, hasLineOfSight,
