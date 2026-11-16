@@ -188,3 +188,136 @@ live three-player session is still the acceptance test (spec §8 Phase 2).**
   mid-fight (client-side).
 - **Live Render service still runs the pre-Phase-2 build — needs the manual
   redeploy trigger (parent triggers it; report the commit SHA).**
+## Addendum — Phase 3: Battle Royale (2026-11-16)
+
+**Local tests pass. Live WebSocket test written, PENDING-REDEPLOY. Browser
+play test is a further gate (client worker + verifier). Matt's correction
+applies from Phase 3 on: "test the game AS you build it" — code review +
+"Matt's playtest settles it" alone is no longer the gate.**
+
+### Files (all in `hidden_files/phase0-server/`, unless noted)
+- `server.js` — extended in place (Phase 1/2 base kept: 20 Hz tick, flow
+  field, delta snapshots, per-player event queues, wave machine). +~370
+  lines: mode select at creation (`create` with `mode`, never switches
+  mid-game), BR drop-in (8 scattered points, pairwise ≥ 5 tiles, melee-only
+  loadout, role ability + passive still apply), 12 fixed tiered ground
+  spawns (10 crates + 12 = 22 loot points), risk-tiered crate rolls (BR
+  only), 6-phase shrinking zone with next-circle preview + per-phase DPS,
+  zone-paced director (no waves), last-standing win detection (solo +
+  squad, downed-unrevivable ends the match), BR end screen (placement,
+  survivalMs, zonesSurvived, winners), zone damage during disconnect
+  grace. `welcome`/`created`/snapshot/`/stats` carry `mode`; snapshot
+  carries `zone` + `groundLoot`.
+- `test-phase3.js` — 90 assertions (unit on `Session` + live WS smoke test
+  for create-with-mode on PORT 3003).
+- `test-phase3-live.js` — NEW, per Matt's correction: three real WebSocket
+  clients against the DEPLOYED Render server (same pattern as
+  test-public.js: `ws` + https-proxy-agent, /health wake, 20 Hz inputs,
+  500 ms pings). Per-job sections with PASS/FAIL/SKIP and real numbers
+  (RTT, snapshot rate, positions, HP, spawn counts, end-screen fields).
+  Exits 0/1. Fails fast with BUILD MISMATCH if the deployed server is not
+  the Phase 3 build.
+- `../phase3-protocol.md` — the client contract: `create` mode, zone
+  schedule table, loot tier tables, director-by-phase table, snapshot
+  additions, new events (`zone-phase`, `zone-shrink-start`,
+  `ground-loot-taken`), BR end-screen fields, §13 simplifications.
+- `package.json` — unchanged (no new test script added; run
+  `node test-phase3.js` / `node test-phase3-live.js` directly).
+
+### Test results (local)
+- `node --check` on `server.js`, `test-phase3.js`, `test-phase3-live.js`:
+  all pass.
+- `node test-phase3.js`: **run=90, passed=90, failed=0** (six consecutive
+  green runs after the last flake fix).
+- `node test-phase1.js`: **83/84** — the single failure is the same
+  pre-existing flaky `every zombie reaches a stationary player` test
+  (documented as failing 6/8 on the original code; NOT a regression).
+- `node test-phase2.js`: **run=126, passed=126, failed=0**.
+- `node test-two-clients.js`: **PASS, 0 failed** (8/8).
+- `node test-events-two-clients.js`: **PASS, run=11, passed=11**.
+
+### Test results (live — PENDING-REDEPLOY)
+- `node test-phase3-live.js` against
+  `wss://zombie-phase0-spike.onrender.com`: **NOT RUN — the deployed
+  server still runs the pre-Phase-3 build.** Verified the script's
+  fail-fast path live: /health ok, 3 clients connected, `create` returned
+  `{type:'created', code:'PXQK', id:'p11'}` with NO `mode` → BUILD
+  MISMATCH, clean exit. **Phase 3 is NOT done until this script passes
+  against the redeployed server** (parent arranges the Render redeploy,
+  then the live-test run; fix + re-push + re-deploy + re-test until green).
+- Browser play test (headless Chrome, local server via `npm start`) is
+  owned by the client worker + verifier, not by this server work. Nothing
+  in Phase 3 blocks it.
+
+### PASS/FAIL per job area
+| Job | Verdict | Notes |
+|---|---|---|
+| 3.1 Mode select + drop-in | PASS (local) | `create` mode survival/battle-royale, invalid → survival; mode in welcome/snapshot/`created`; never switches mid-game; cap 8 enforced; 8 drop points pairwise ≥ 5 (measured 5.39 min in smoke), all walkable in-bounds; melee-only (no gun, no ammo); Heavy keeps no shotgun but gets 125 HP + Bulwark; grace blocks PvP (shot hit:false, HP unchanged) but not zombie damage; Survival role weapons unchanged |
+| 3.2 Loot distribution | PASS (local) | 10 crates + 12 ground = 22 points; tier audit (no low-tier rifle/shotgun/SMG; every high-tier a gun or 2+ meds); ground spawn finite (second player gets nothing); crate finite (re-loot returns nothing); crate weapon chance tiered in BR (50/35/20%) and flat 35% in Survival; death pile in BR byte-identical in structure to the Survival rule (carried drops, equipped stays) |
+| 3.3 Shrinking zone | PASS (local) | 6 phases, radii 18/13/9.5/6.5/4/2.5, DPS 1/2/4/8/15/25 monotonic; 460 s to the final circle (~10–12 min match); shrink 30 s, waits 50–75 s; centres never concentric (≥ 1.5 observed, 1.6 nominal); preview == arriving circle for every transition in a full live run; shrink interpolates; DPS measured per phase (100 → 100−DPS after 1 s outside); phase 1 forgiving (100 → 80 in 10 s), final lethal (downed in 4 s); inside takes no damage; out-runnable check holds for every transition |
+| 3.3 Zombies + zone | PASS (local) | Director spawns inside the current zone (30 s run, all inside); outside zombie takes zone damage + walks to centre; outside zombie dies if it stays out; no pile-up outside the circle (30 s, phase 3) |
+| 3.4 Zone-paced director | PASS (local) | Interval falls monotonically (2500→700 ms); brute share never falls (0→15%), runner never falls (0→30%); measured spawn rate phase 5 > 2× phase 0 in 30 s; no waves in BR (wave 0, phase `br`, no wave-start events) |
+| 3.4 Win detection | PASS (local) | Solo ending (placement 1 vs 2); squad ending (both #1, victim #3); last-two-are-squadmates ends immediately; downed-last-player ends WITHOUT waiting for bleed-out; downed WITH a living squadmate does NOT end the match; placement correct for every player (death order); a lone player never instantly wins |
+| 3.4 BR end screen | PASS (local) | Every field present (placement, kills, headshots, playersKilled, revives, damageDealt, lootCollected, survivalMs, zonesSurvived, titles); fields match live player stats; Last One Standing to the winner (most zombie kills for a squad win); Most Revives / Most Betrayals omitted when nobody qualifies; Survival end screen has no BR-only fields |
+| 3.4 Disconnects in BR | PASS (local) | Zone damage ticks during disconnect grace (100 → 85 in 1 s at DPS 15); disconnected character outside the zone dies on schedule (downed in 5 s at DPS 25, dead after bleed-out); Survival grace unchanged (alive at 30 s, dead at 31 s, no zone) |
+| Survival regression | PASS (local) | Breather → wave 1; wave clear → breather; extraction opens after wave 5; waveCount/waveDef values unchanged; no zone, no ground loot, no BR win logic, no BR end-screen fields in Survival |
+
+### Phase 1/2 defects found and fixed (by the Phase 3 work)
+- **Co-winners got different placements:** the end-screen sort assigned
+  `i + 1` by position, so squad co-winners got #1 and #2. Winners now
+  share #1 (standard competition ranking: next placement is #3).
+- **Next-zone centre clamp was inverted for r > 8:** the arena is 30 wide
+  × 16 tall, so a circle fits fully only for r ≤ 8 — the old clamp
+  (`[r, 30−r]` × `[14+r, 30−r]`) produced an empty Y range and pinned
+  every large next centre to y = 23.5. The clamp now constrains the centre
+  to the arena rect for radii that cannot fit, and to full containment
+  only when the circle fits.
+- **BR surges spawned at the gates, outside the zone:** `triggerSurge`,
+  noise-surge runners, and isolated-pressure runners all used gate spawns.
+  In BR every spawn (director, surge, pressure, noise) now goes through
+  the zone spawn point — the horde is always in the circle with the
+  players. (Found by the "no zombie pile-up" test.)
+- **Next-centre minimum shift vs rounding:** sampling exactly 1.5 tiles
+  could round to 1.49 after the 2-decimal snapshot rounding. The nominal
+  minimum is now 1.6, so the observed shift is always ≥ 1.5.
+- **Test-only flakes fixed (not server bugs):** the spawn-rate measurement
+  was polluted by surge/isolated-pressure spawns (now suppressed in that
+  measurement); a downed-player test was flaky because surge zombies could
+  execute the downed player mid-window (now wiped per tick); a 2-player
+  revive scenario is impossible by design (downing the last opponent ends
+  the match) so the end-screen test uses 3 players.
+
+### Simplifications vs spec (Matt's filter — see phase3-protocol.md §13)
+- **Map scope:** BR plays on the verified Gate Town arena (x 0–30,
+  y 14–30), NOT the full 60×60 map (spec §2.7). Only Gate Town south has
+  verified geometry. Full-map BR is a Phase 4 job. The zone/loot/drop-in/
+  win systems transfer unchanged.
+- **Zone fit:** a circle fits fully only for r ≤ 8 in the 16-tall arena;
+  larger next circles are centred in the arena rect instead of fully
+  contained. Phase 0–1 circles extend past the arena edges — fine, they
+  cover the arena.
+- **Zone DPS during shrink:** the DPS of the phase being left applies
+  until the shrink completes; the new DPS applies on arrival.
+- **Zone damage vs downed players:** HP tick applies to alive players
+  only; downed players bleed out (and the win check ends the match without
+  waiting when they cannot be revived). Zone damage does not interrupt
+  heal/build channels.
+- **Crate tiers:** tier only changes the weapon-grant chance (50/35/20%);
+  attachment window is the next 20% in both modes, so Survival odds are
+  unchanged.
+- **Ground loot has no attachments:** scopes / extended mags / grips come
+  from crates only.
+- **Placement ties:** co-winners share #1; next placement is #3.
+- **A lone player never instantly wins:** the BR win check needs ≥ 2
+  players to have ever joined.
+
+### Could NOT verify (needs live play / the pending gates)
+- Everything in the Phase 1/2 "could NOT verify" lists still stands, plus:
+  the live WebSocket test (test-phase3-live.js) has not run against a
+  deployed Phase 3 build yet; the browser play test (headless Chrome,
+  local server) has not run; whether the zone timings / DPS feel right in
+  a real 4–8 player match (the 460 s schedule is a tuning number — if
+  matches run past ~25 min it is too slow); whether the BR opening
+  scramble (melee-only, loot race) feels right with real players.
+- **Live Render service still runs the pre-Phase-3 build — needs the manual
+  redeploy trigger (parent triggers it; report the commit SHA).**

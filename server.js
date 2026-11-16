@@ -4,6 +4,14 @@
 // Authoritative: server decides positions, HP, ammo, loot, zombie AI, waves,
 // damage, deaths — plus squads, trust, roles, perks, barricades, traps.
 //
+// Phase 3 additions (spec §2.7; deep plan Jobs 3.1–3.4): Battle Royale mode
+// on the verified Gate Town arena — mode select at creation (never switches
+// mid-game), scattered melee-only drop-in, tiered ground loot, a 6-phase
+// shrinking safe zone with next-circle preview + per-phase damage, a
+// zone-paced director (no waves), last-standing win detection (solo +
+// squad), BR end screen (placement + BR score fields), zone damage during
+// disconnect grace. Survival is untouched by BR logic (see tick() branch).
+//
 // Phase 2 additions (spec §2.4, §2.5, §7; deep plan Jobs 2.1–2.6):
 //   roles (6, pick at drop-in via {type:'role'}), signature abilities
 //   ({type:'ability'}), squads (invite/accept/leave/waypoint/shared loot),
@@ -154,6 +162,116 @@ function waveCount(n, playersAlive) {
   return Math.round(waveDef(n).count * (1 + 0.35 * Math.max(0, playersAlive - 1)));
 }
 
+// ---- Battle Royale (Phase 3, spec §2.7; map scope: verified Gate Town
+// arena only — x 0..30, y 14..30. Full-map BR is a Phase 4 job.) ----
+// Zone schedule: 6 phases (0 = full-arena circle, 5 = final small circle).
+// Each phase = wait (circle holds, next circle previewed) + shrink (~30 s).
+// Total zone time to the final circle: 460 s (~7.7 min); with drop-in +
+// looting + the final fight a match lands ~10–12 min (target 10–20 min).
+// DPS rises per phase: early phases forgive a slow rotate, the final
+// phase (25 HP/s) kills a full-HP player in 4 s.
+const BR_ZONE_SCHEDULE = [
+  { phase: 0, radius: 18,   waitMs: 75000, shrinkMs: 30000, dps: 1 },
+  { phase: 1, radius: 13,   waitMs: 70000, shrinkMs: 30000, dps: 2 },
+  { phase: 2, radius: 9.5,  waitMs: 60000, shrinkMs: 30000, dps: 4 },
+  { phase: 3, radius: 6.5,  waitMs: 55000, shrinkMs: 30000, dps: 8 },
+  { phase: 4, radius: 4,    waitMs: 50000, shrinkMs: 30000, dps: 15 },
+  { phase: 5, radius: 2.5,  waitMs: Infinity, shrinkMs: 0,  dps: 25 },
+];
+const BR_ZONE_TOTAL_MS = BR_ZONE_SCHEDULE.slice(0, 5).reduce((s, ph) => s + ph.waitMs + ph.shrinkMs, 0); // 460000
+const BR_ZONE_CENTRE = { x: 15, y: 22 }; // arena centre; r=18 covers every corner (17.0 to (0,14)/(30,30))
+const BR_ZONE_PHASES = BR_ZONE_SCHEDULE.length;
+
+// Next-zone centre: random point inside the current circle, at least 1.5
+// tiles from the current centre (successive circles are NEVER concentric —
+// camping the middle is not a strategy), constrained so the whole next
+// circle stays inside the arena bounds (x 0..30, y 14..30).
+function computeNextZone(current, nextRadius) {
+  // Centre bounds: the circle stays inside the arena when it CAN fit.
+  // The arena is 30 wide x 16 tall, so a circle fits fully only for r<=8
+  // (vertically) / r<=15 (horizontally). For larger radii the centre is
+  // clamped to the arena rect itself — the circle still covers the arena
+  // (a r=13 circle centred in the rect covers y 14..30 from any centre
+  // y in 14..30 only when centred near 22, which the shift rule below
+  // already guarantees: the next centre stays near the current one).
+  const minX = nextRadius <= 15 ? nextRadius : 0;
+  const maxX = nextRadius <= 15 ? 30 - nextRadius : 30;
+  const minY = nextRadius <= 8 ? 14 + nextRadius : 14;
+  const maxY = nextRadius <= 8 ? 30 - nextRadius : 30;
+  const maxShift = Math.max(0, (current.r - nextRadius) * 0.7);
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const ang = Math.random() * Math.PI * 2;
+    // 1.6 nominal so the 2-decimal rounding below can never push the
+    // observed shift under the 1.5-tile guarantee.
+    const d = 1.6 + Math.random() * Math.max(0, maxShift - 1.6);
+    const cx = clamp(current.x + Math.cos(ang) * d, minX, maxX);
+    const cy = clamp(current.y + Math.sin(ang) * d, minY, maxY);
+    if (dist(cx, cy, current.x, current.y) >= 1.5) return { x: +cx.toFixed(2), y: +cy.toFixed(2), r: nextRadius };
+  }
+  // Deterministic fallback: shift 2 tiles in a direction that stays in bounds.
+  let cx = current.x, cy = current.y;
+  if (cx + 2 <= maxX) cx += 2;
+  else if (cx - 2 >= minX) cx -= 2;
+  else if (cy + 2 <= maxY) cy += 2;
+  else cy -= 2;
+  return { x: +cx.toFixed(2), y: +cy.toFixed(2), r: nextRadius };
+}
+
+// BR drop points: 8 spread points, pairwise >= 5 tiles, all on walkable
+// in-bounds tiles (checked against arena.tileBlocked by test-phase3.js).
+// The 6 Survival spawns are too close together (min 3.16) for BR.
+const BR_DROP_POINTS = [
+  { id: 'br-1', x: 5.5, y: 15.5 }, { id: 'br-2', x: 11.5, y: 15.5 },
+  { id: 'br-3', x: 18.5, y: 15.5 }, { id: 'br-4', x: 25.5, y: 15.5 },
+  { id: 'br-5', x: 9.5, y: 20.5 }, { id: 'br-6', x: 21.5, y: 20.5 },
+  { id: 'br-7', x: 13.5, y: 25.5 }, { id: 'br-8', x: 19.5, y: 28.5 },
+];
+const BR_MIN_SPAWN_DIST = 5;
+
+// BR ground loot: 12 fixed takeable spawns (10 crates + 12 = 22 loot
+// points). Tiered by risk: high = plaza/gate (guns + medkits), mid =
+// inner ring (a pistol, ammo, a med), low = edges (pistol ammo, bandages).
+const BR_GROUND_LOOT = [
+  { id: 'g1', x: 15.5, y: 17.5, tier: 'high', items: { weapons: ['rifle'], ammo: { rifle: 40 } } },
+  { id: 'g2', x: 14.5, y: 15.5, tier: 'high', items: { weapons: ['shotgun'], ammo: { shells: 24 } } },
+  { id: 'g3', x: 17.5, y: 19.5, tier: 'high', items: { weapons: ['smg'], ammo: { smg: 60 } } },
+  { id: 'g4', x: 15.5, y: 21.5, tier: 'high', items: { meds: 2, ammo: { rifle: 24 } } },
+  { id: 'g5', x: 10.5, y: 22.5, tier: 'mid', items: { weapons: ['pistol'], ammo: { pistol: 48 } } },
+  { id: 'g6', x: 21.5, y: 22.5, tier: 'mid', items: { ammo: { smg: 60 }, meds: 1 } },
+  { id: 'g7', x: 26.5, y: 21.5, tier: 'mid', items: { ammo: { shells: 24 }, meds: 1 } },
+  { id: 'g8', x: 10.5, y: 27.5, tier: 'mid', items: { ammo: { pistol: 48 }, meds: 1 } },
+  { id: 'g9', x: 5.5, y: 17.5, tier: 'low', items: { meds: 1, ammo: { pistol: 24 } } },
+  { id: 'g10', x: 27.5, y: 16.5, tier: 'low', items: { ammo: { pistol: 24 }, materials: 2 } },
+  { id: 'g11', x: 19.5, y: 29.5, tier: 'low', items: { meds: 1, ammo: { smg: 30 } } },
+  { id: 'g12', x: 7.5, y: 20.5, tier: 'low', items: { weapons: ['pistol'], ammo: { pistol: 24 } } },
+];
+// Crate risk tiers (BR only — Survival keeps the flat 35% weapon roll).
+const BR_CRATE_TIER = {
+  'crate-1': 'high', 'crate-2': 'high',
+  'crate-3': 'mid', 'crate-5': 'mid', 'crate-8': 'mid',
+  'crate-4': 'low', 'crate-6': 'low', 'crate-7': 'low', 'crate-9': 'low', 'crate-10': 'low',
+};
+function crateWeaponChance(mode, tier) {
+  if (mode !== 'battle-royale') return 0.35;
+  return tier === 'high' ? 0.5 : tier === 'low' ? 0.2 : 0.35;
+}
+// Zone-paced director: continuous spawning, no waves. Spawn interval
+// falls and the mix shifts toward tougher types as the zone shrinks —
+// both monotonic by phase (asserted in test-phase3.js).
+const BR_DIRECTOR = [
+  { phase: 0, intervalMs: 2500, mix: { shambler: 1 } },
+  { phase: 1, intervalMs: 2000, mix: { shambler: 0.7, runner: 0.3 } },
+  { phase: 2, intervalMs: 1600, mix: { shambler: 0.55, runner: 0.3, spitter: 0.1, screamer: 0.05 } },
+  { phase: 3, intervalMs: 1200, mix: { shambler: 0.45, runner: 0.3, spitter: 0.1, screamer: 0.05, brute: 0.1 } },
+  { phase: 4, intervalMs: 900, mix: { shambler: 0.4, runner: 0.3, spitter: 0.12, screamer: 0.08, brute: 0.1 } },
+  { phase: 5, intervalMs: 700, mix: { shambler: 0.35, runner: 0.3, spitter: 0.12, screamer: 0.08, brute: 0.15 } },
+];
+function brMixPick(mix) {
+  let r = Math.random(), acc = 0;
+  for (const [type, frac] of Object.entries(mix)) { acc += frac; if (r <= acc) return type; }
+  return 'shambler';
+}
+
 let nextSessionNum = 1, nextPlayerNum = 1, nextZombieId = 1, nextLootId = 1;
 const sessions = new Map(); // code -> Session
 const anomalies = [];       // movement/cheat corrections, capped
@@ -218,7 +336,7 @@ class Session {
   constructor(code, opts = {}) {
     this.code = code;
     this.maxPlayers = opts.maxPlayers || MAX_PLAYERS_DEFAULT;
-    this.mode = 'survival';
+    this.mode = opts.mode === 'battle-royale' ? 'battle-royale' : 'survival'; // set at creation, NEVER switches mid-game
     this.createdAt = Date.now();
     this.tickCount = 0;
     this.nowMs = 0; // session clock (advances 50ms/tick; drives timers)
@@ -257,6 +375,12 @@ class Session {
     this.nextTrapId = 1;
     this.burnZones = []; // {x, y, until, ownerId} — molotov fire, 10 dps / 3 s
     this.deathSeq = 0; // monotonic death order (Last One Standing tie-break)
+    // Phase 3 (Battle Royale) state — null/empty in Survival.
+    this.zone = null; // {phase, current:{x,y,r}, next:{x,y,r}|null, state, phaseEndsAt, shrinkEndsAt, shrinkFrom, shrinkTo, dps}
+    this.groundLoot = []; // BR fixed ground spawns (copies of BR_GROUND_LOOT, taken:false)
+    this.brWinners = null; // [playerIds] set when the BR win is detected
+    this.peakPlayers = 0; // most players ever in the session (BR win needs >= 2)
+    this.brDropOrder = null; // shuffled BR_DROP_POINTS, assigned in join order
   }
 
   alivePlayers() { return [...this.players.values()].filter(p => p.state === 'alive'); }
@@ -405,6 +529,19 @@ class Session {
   setRole(p, role) {
     if (!ROLES[role]) return { error: 'unknown role' };
     if (p.role === role && p.roleSet) return { ok: true, role };
+    if (this.mode === 'battle-royale') {
+      // BR: melee-only drop-in — the role grants its ability + passive,
+      // NEVER a starting gun. The gun is loot (§2.7).
+      p.role = role;
+      p.roleSet = true;
+      if (p.role === 'medic' && p.carried.meds < ROLES.medic.medsStart) p.carried.meds = ROLES.medic.medsStart;
+      const before = p.maxHp;
+      p.maxHp = this.computeMaxHp(p);
+      if (p.maxHp > before) p.hp = Math.min(p.maxHp, p.hp + (p.maxHp - before));
+      else p.hp = Math.min(p.hp, p.maxHp);
+      this.broadcast({ type: 'role-set', playerId: p.id, role });
+      return { ok: true, role };
+    }
     const fresh = p.weapons.length === 2 && p.weapons.includes('pistol') && p.weapons.includes('melee');
     p.role = role;
     p.roleSet = true;
@@ -632,14 +769,26 @@ class Session {
     if (this.players.size >= this.maxPlayers) return { error: 'session full' };
     const num = nextPlayerNum++;
     const id = `p${num}`;
-    const spawn = arena.PLAYER_SPAWNS[(num - 1) % arena.PLAYER_SPAWNS.length];
+    // BR drop-in: scattered points across the arena (shuffled, join order),
+    // pairwise >= 5 tiles. Survival keeps the 6 plaza spawns.
+    let spawn;
+    if (this.mode === 'battle-royale') {
+      if (!this.brDropOrder) this.brDropOrder = [...BR_DROP_POINTS].sort(() => Math.random() - 0.5);
+      spawn = this.brDropOrder[this.players.size % BR_DROP_POINTS.length];
+    } else {
+      spawn = arena.PLAYER_SPAWNS[(num - 1) % arena.PLAYER_SPAWNS.length];
+    }
+    const isBR = this.mode === 'battle-royale';
     const p = {
       id, ws, color: COLORS[(num - 1) % COLORS.length],
       x: spawn.x, y: spawn.y, vx: 0, vy: 0,
       hp: 100, maxHp: 100, state: 'alive', // alive | downed | dead | extracted
       downedTimerMs: 0, graceEndsAt: this.nowMs + GRACE_SECONDS * 1000,
-      weapons: ['pistol', 'melee'], currentWeapon: 'pistol',
-      ammo: { pistol: WEAPONS.pistol.reserveStart, shells: WEAPONS.shotgun.reserveStart, rifle: WEAPONS.rifle.reserveStart, smg: WEAPONS.smg.reserveStart },
+      // BR: melee only, no gun, no ammo — every gun is looted (§2.7).
+      weapons: isBR ? ['melee'] : ['pistol', 'melee'],
+      currentWeapon: isBR ? 'melee' : 'pistol',
+      ammo: isBR ? { pistol: 0, shells: 0, rifle: 0, smg: 0 }
+                 : { pistol: WEAPONS.pistol.reserveStart, shells: WEAPONS.shotgun.reserveStart, rifle: WEAPONS.rifle.reserveStart, smg: WEAPONS.smg.reserveStart },
       mag: { pistol: WEAPONS.pistol.mag, shotgun: WEAPONS.shotgun.mag, rifle: WEAPONS.rifle.mag, smg: WEAPONS.smg.mag },
       reloadingUntil: 0, reloadingWeapon: null, lastShotMs: -9999, fireHeld: false,
       aim: { x: 1, y: 0 }, keys: { up: false, down: false, left: false, right: false },
@@ -665,6 +814,7 @@ class Session {
       seq: 0, lastInputSeq: 0,
     };
     this.players.set(id, p);
+    this.peakPlayers = Math.max(this.peakPlayers, this.players.size);
     if (this.phase === 'lobby') this.startSession();
     return { player: p };
   }
@@ -685,10 +835,130 @@ class Session {
   }
 
   startSession() {
+    if (this.mode === 'battle-royale') {
+      // BR: no waves, no breather, no extraction — the zone is the clock.
+      this.phase = 'br';
+      this.wave = 0;
+      this.groundLoot = BR_GROUND_LOOT.map(g => ({ ...g, items: JSON.parse(JSON.stringify(g.items)), taken: false }));
+      this.initZone();
+      this.broadcast({ type: 'session-start', code: this.code, mode: 'battle-royale' });
+      return;
+    }
     this.phase = 'breather';
     this.wave = 0;
     this.breatherEndsAt = this.nowMs + BREATHER_SECONDS * 1000;
     this.broadcast({ type: 'session-start', code: this.code });
+  }
+
+  // ---- Battle Royale: zone, zone-paced director, win detection ----
+  initZone() {
+    this.zone = {
+      phase: 0,
+      current: { x: BR_ZONE_CENTRE.x, y: BR_ZONE_CENTRE.y, r: BR_ZONE_SCHEDULE[0].radius },
+      next: null, state: 'waiting',
+      phaseEndsAt: this.nowMs + BR_ZONE_SCHEDULE[0].waitMs,
+      shrinkEndsAt: 0, shrinkFrom: null, shrinkTo: null,
+      dps: BR_ZONE_SCHEDULE[0].dps,
+    };
+    // The next circle is computed + broadcast NOW (preview) and is the
+    // exact circle the shrink arrives at — preview == arriving circle.
+    this.zone.next = computeNextZone(this.zone.current, BR_ZONE_SCHEDULE[1].radius);
+    this.broadcast({ type: 'zone-phase', phase: 0, current: { ...this.zone.current }, next: { ...this.zone.next }, dps: this.zone.dps });
+  }
+  // Zone state machine + zone damage. Runs every tick in BR only.
+  zoneTick() {
+    if (this.mode !== 'battle-royale' || !this.zone || this.ended) return;
+    const z = this.zone;
+    if (z.state === 'waiting') {
+      if (z.phase >= BR_ZONE_SCHEDULE.length - 1) { /* final circle holds forever */ }
+      else if (this.nowMs >= z.phaseEndsAt) {
+        z.state = 'shrinking';
+        z.shrinkFrom = { ...z.current };
+        z.shrinkTo = { ...z.next };
+        z.shrinkEndsAt = this.nowMs + BR_ZONE_SCHEDULE[z.phase].shrinkMs;
+        this.broadcast({ type: 'zone-shrink-start', phase: z.phase, from: { ...z.shrinkFrom }, to: { ...z.shrinkTo } });
+      }
+    } else if (z.state === 'shrinking') {
+      const total = BR_ZONE_SCHEDULE[z.phase].shrinkMs;
+      const t = clamp((this.nowMs - (z.shrinkEndsAt - total)) / total, 0, 1);
+      z.current = {
+        x: z.shrinkFrom.x + (z.shrinkTo.x - z.shrinkFrom.x) * t,
+        y: z.shrinkFrom.y + (z.shrinkTo.y - z.shrinkFrom.y) * t,
+        r: z.shrinkFrom.r + (z.shrinkTo.r - z.shrinkFrom.r) * t,
+      };
+      if (t >= 1) {
+        z.phase++;
+        z.current = { ...z.shrinkTo };
+        z.dps = BR_ZONE_SCHEDULE[z.phase].dps;
+        z.state = 'waiting';
+        if (z.phase < BR_ZONE_SCHEDULE.length - 1) {
+          z.next = computeNextZone(z.current, BR_ZONE_SCHEDULE[z.phase + 1].radius);
+          z.phaseEndsAt = this.nowMs + BR_ZONE_SCHEDULE[z.phase].waitMs;
+        } else {
+          z.next = null; // final circle: no next, it holds
+          z.phaseEndsAt = Infinity;
+        }
+        this.broadcast({ type: 'zone-phase', phase: z.phase, current: { ...z.current }, next: z.next ? { ...z.next } : null, dps: z.dps });
+      }
+    }
+    // Zone damage: steady HP tick while outside, server-side, authoritative.
+    // Applies to alive players INCLUDING disconnected ones — the zone does
+    // not wait out a disconnect grace. Downed players bleed out instead.
+    for (const p of this.players.values()) {
+      if (p.state !== 'alive') continue;
+      if (dist(p.x, p.y, z.current.x, z.current.y) > z.current.r) {
+        p.hp -= z.dps * TICK;
+        if (p.hp <= 0) this.downPlayer(p, null);
+      }
+    }
+  }
+  // Zone-paced director: continuous spawning, no waves. Rate + toughness
+  // rise with the zone phase (BR_DIRECTOR table).
+  brDirectorTick() {
+    if (this.mode !== 'battle-royale' || !this.zone || this.ended) return;
+    if (!this.alivePlayers().length) return; // nobody to hunt — don't stockpile
+    const def = BR_DIRECTOR[this.zone.phase];
+    this.spawnTimerMs += TICK_MS;
+    if (this.spawnTimerMs >= def.intervalMs) {
+      this.spawnTimerMs = 0;
+      const pos = this.zoneSpawnPoint();
+      if (pos) this.spawnZombieAt(brMixPick(def.mix), pos.x, pos.y);
+    }
+    this.drainQueue();
+  }
+  // Spawn point inside the current safe zone, at its edges (0.7–0.95 r),
+  // on a walkable tile, >= 6 tiles from any living player when possible.
+  zoneSpawnPoint() {
+    const z = this.zone.current;
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < 10; i++) {
+        const ang = Math.random() * Math.PI * 2;
+        const rr = z.r * (0.7 + Math.random() * 0.25);
+        const x = z.x + Math.cos(ang) * rr, y = z.y + Math.sin(ang) * rr;
+        if (x < 0 || x > 30 || y < 14 || y > 30) continue;
+        if (arena.tileBlocked(Math.floor(x), Math.floor(y))) continue;
+        if (pass === 0 && [...this.players.values()].some(p => p.state === 'alive' && dist(x, y, p.x, p.y) < 6)) continue;
+        return { x: +x.toFixed(2), y: +y.toFixed(2) };
+      }
+    }
+    return null;
+  }
+  // Last-standing win detection. A player counts as standing if alive, or
+  // downed with a living squadmate who could still revive them. A downed
+  // player whose squadmates are all dead is effectively dead — the match
+  // ends without waiting for their bleed-out timer.
+  checkBRWin() {
+    if (this.mode !== 'battle-royale' || this.ended || this.peakPlayers < 2) return;
+    if (!this.connectedPlayers().length) return; // all disconnected: hibernate, don't crown
+    const standing = (p) => p.state === 'alive' ||
+      (p.state === 'downed' && [...this.players.values()].some(q => q !== p && q.state === 'alive' && q.squadId && q.squadId === p.squadId));
+    const alive = [...this.players.values()].filter(standing);
+    if (!alive.length) { this.endSession('wipe'); return; }
+    const units = new Set(alive.map(p => p.squadId || `solo:${p.id}`));
+    if (units.size === 1) {
+      this.brWinners = alive.map(p => p.id);
+      this.endSession('br-win');
+    }
   }
 
   startWave(n) {
@@ -717,11 +987,13 @@ class Session {
     this.broadcast({ type: 'wave-start', wave: n, count: total });
   }
 
-  spawnZombie(type, gate) {
+  spawnZombie(type, gate, pos) {
     if (this.zombies.size >= ZOMBIE_CAP) { this.spawnQueue.push({ type, gate }); return false; }
     const base = ZOMBIE_TYPES[type];
     let elite = null;
-    if (Math.random() < 0.08 && this.wave >= 3) elite = Object.keys(ELITES)[Math.floor(Math.random() * 4)];
+    // Elites from wave 3 (Survival) / zone phase 3 (BR).
+    const effWave = this.mode === 'battle-royale' ? (this.zone ? this.zone.phase : 0) : this.wave;
+    if (Math.random() < 0.08 && effWave >= 3) elite = Object.keys(ELITES)[Math.floor(Math.random() * 4)];
     const affix = elite ? ELITES[elite] : null;
     const hp = Math.round(base.hp * (affix ? affix.hpMul : 1));
     const id = `z${nextZombieId++}`;
@@ -729,8 +1001,20 @@ class Session {
     const g = gate || gates[Math.floor(Math.random() * gates.length)] || arena.GATES[0];
     // A gate may define several spawn tiles (main gate = 2-wide gap):
     // pick one at random so zombies spread across the opening.
+    // `pos` overrides the gate (BR zone spawns). In BR, ALL spawns go
+    // through the zone (inside the current safe zone) — a gate spawn
+    // would drop zombies outside the circle, which the spec forbids.
     let gx = g.x, gy = g.y;
-    if (g.tiles && g.tiles.length) {
+    if (pos) { gx = pos.x; gy = pos.y; }
+    else if (this.mode === 'battle-royale' && this.zone) {
+      const zp = this.zoneSpawnPoint();
+      if (zp) { gx = zp.x; gy = zp.y; }
+      else if (g.tiles && g.tiles.length) {
+        const t = g.tiles[Math.floor(Math.random() * g.tiles.length)];
+        gx = t.x; gy = t.y;
+      }
+    }
+    else if (g.tiles && g.tiles.length) {
       const t = g.tiles[Math.floor(Math.random() * g.tiles.length)];
       gx = t.x; gy = t.y;
     }
@@ -746,6 +1030,9 @@ class Session {
     this.zombies.set(id, z);
     return true;
   }
+
+  // Spawn a zombie at an explicit point (BR zone spawns).
+  spawnZombieAt(type, x, y) { return this.spawnZombie(type, null, { x, y }); }
 
   // Drain spawn queue at gates as zombies die (cap enforcement).
   drainQueue() {
@@ -769,8 +1056,10 @@ class Session {
     this.director.eased = nearWipe;
     // Comfortable -> surge (not during breather, not more than every ~30s,
     // and only while the horde is small — a surge every 20 s would drown
-    // wave 1; the director pushes, it does not flood).
-    if (!nearWipe && avgHp > 0.7 && this.phase === 'wave' &&
+    // wave 1; the director pushes, it does not flood). In BR the director
+    // runs continuously (phase 'br'), paced by the zone instead of waves.
+    const inCombat = this.phase === 'wave' || this.mode === 'battle-royale';
+    if (!nearWipe && avgHp > 0.7 && inCombat &&
         this.tickCount - this.director.lastSurgeTick > 600 &&
         this.zombies.size < 20 && Math.random() < 0.005) {
       this.triggerSurge('comfortable');
@@ -794,7 +1083,7 @@ class Session {
     // Isolated-player pressure: lone looter (>10 tiles from nearest ally)
     // draws Runners. Simple check once per second. Scouts are ignored
     // unless alone (their passive is a smaller aggro radius).
-    if (this.tickCount % 20 === 0 && this.phase === 'wave') {
+    if (this.tickCount % 20 === 0 && inCombat) {
       for (const p of alive) {
         if (p.role === 'scout' && alive.some(q => q !== p && q.role !== 'scout')) continue;
         const nearest = Math.min(...alive.filter(q => q !== p).map(q => dist(p.x, p.y, q.x, q.y)), Infinity);
@@ -808,7 +1097,7 @@ class Session {
   triggerSurge(reason) {
     this.director.surges++;
     this.director.lastSurgeTick = this.tickCount;
-    const n = 4 + this.wave;
+    const n = 4 + (this.mode === 'battle-royale' && this.zone ? this.zone.phase : this.wave);
     for (let i = 0; i < n; i++) this.spawnZombie(Math.random() < 0.7 ? 'shambler' : 'runner');
     this.broadcast({ type: 'surge', reason, count: n });
   }
@@ -1048,6 +1337,7 @@ class Session {
     p.state = 'dead'; p.spectating = true; p.hp = 0;
     p.deathMs = this.nowMs;
     p.deathSeq = ++this.deathSeq;
+    if (this.mode === 'battle-royale' && this.zone) p.zonePhaseAtDeath = this.zone.phase;
     // A player who downed the victim owns the death if the victim then
     // bleeds out or is finished by zombies / a Brute slam — that is a kill
     // (-20), not an execute (-30, only for shooting a downed player).
@@ -1093,20 +1383,51 @@ class Session {
   endSession(reason) {
     this.ended = true; this.phase = 'ended'; this.endReason = reason;
     const players = [...this.players.values()];
+    const isBR = this.mode === 'battle-royale';
     const titles = [];
-    // Last One Standing: the last alive/extracted player, else the last to die.
-    const standing = players.filter(p => p.state === 'alive' || p.state === 'extracted');
-    if (standing.length === 1) titles.push({ title: 'Last One Standing', playerId: standing[0].id });
-    else if (!standing.length) {
-      const lastDead = players.filter(p => p.deathSeq !== undefined && p.deathSeq !== null).sort((a, b) => b.deathSeq - a.deathSeq)[0];
-      if (lastDead) titles.push({ title: 'Last One Standing', playerId: lastDead.id });
+    if (isBR && this.brWinners && this.brWinners.length) {
+      // Last One Standing: the winner with the most zombie kills (a squad
+      // win still names one player for the title; all winners are #1).
+      const winPlayers = this.brWinners.map(id => this.players.get(id)).filter(Boolean);
+      const top = [...winPlayers].sort((a, b) => b.kills - a.kills)[0];
+      if (top) titles.push({ title: 'Last One Standing', playerId: top.id });
+    } else {
+      // Last One Standing: the last alive/extracted player, else the last to die.
+      const standing = players.filter(p => p.state === 'alive' || p.state === 'extracted');
+      if (standing.length === 1) titles.push({ title: 'Last One Standing', playerId: standing[0].id });
+      else if (!standing.length) {
+        const lastDead = players.filter(p => p.deathSeq !== undefined && p.deathSeq !== null).sort((a, b) => b.deathSeq - a.deathSeq)[0];
+        if (lastDead) titles.push({ title: 'Last One Standing', playerId: lastDead.id });
+      }
     }
     const mostRevives = players.filter(p => p.revives > 0).sort((a, b) => b.revives - a.revives)[0];
     if (mostRevives) titles.push({ title: 'Most Revives', playerId: mostRevives.id });
     const mostBetrayals = players.filter(p => p.playersKilled > 0).sort((a, b) => b.playersKilled - a.playersKilled)[0];
     if (mostBetrayals) titles.push({ title: 'Most Betrayals', playerId: mostBetrayals.id });
+    // BR placement: winners share #1, then by death time (later death =
+    // better placement). A downed-but-not-dead player at match end ranks
+    // by nowMs.
+    let placement = {};
+    if (isBR) {
+      const winners = new Set(this.brWinners || []);
+      const order = [...players].sort((a, b) => {
+        const aWin = winners.has(a.id), bWin = winners.has(b.id);
+        if (aWin !== bWin) return aWin ? -1 : 1;
+        return (b.deathMs ?? this.nowMs) - (a.deathMs ?? this.nowMs);
+      });
+      let rank = 1;
+      order.forEach((p, i) => {
+        if (i > 0) {
+          const prev = order[i - 1];
+          if (!(winners.has(p.id) && winners.has(prev.id))) rank = i + 1;
+        }
+        placement[p.id] = rank;
+      });
+    }
     this.endScore = {
+      mode: this.mode,
       waveReached: this.wave, kills: this.score.kills, titles,
+      ...(isBR ? { zonePhaseReached: this.zone ? this.zone.phase : 0, winners: this.brWinners || [] } : {}),
       players: players.map(p => ({
         id: p.id, role: p.role, squadId: p.squadId,
         wavesSurvived: this.wave, kills: p.kills, headshots: p.headshots,
@@ -1114,6 +1435,11 @@ class Session {
         lootCollected: p.lootCollected, damageDealt: p.damageDealt,
         timesDowned: p.timesDowned, trust: p.trust, trustRank: trustRank(p.trust),
         xp: p.xp, level: p.level, state: p.state,
+        ...(isBR ? {
+          placement: placement[p.id],
+          survivalMs: (p.deathMs ?? this.nowMs),
+          zonesSurvived: p.zonePhaseAtDeath ?? (this.zone ? this.zone.phase : 0),
+        } : {}),
       })),
     };
     this.broadcast({ type: 'session-end', reason, score: this.endScore });
@@ -1157,13 +1483,17 @@ class Session {
   rollCrateLoot(p, crate) {
     const missing = ['shotgun', 'rifle', 'smg'].filter(w => !p.weapons.includes(w));
     const r = Math.random();
-    if (missing.length && r < 0.35) {
+    // BR: weapon chance is risk-tiered by crate location (high 50%, mid
+    // 35%, low 20%); Survival keeps the flat 35%. Attachment window is the
+    // next 20% in both modes, so Survival odds are unchanged (35/20/45).
+    const weaponChance = crateWeaponChance(this.mode, BR_CRATE_TIER[crate.id] || 'mid');
+    if (missing.length && r < weaponChance) {
       const w = missing[Math.floor(Math.random() * missing.length)];
       this.grantWeapon(p, w);
       this.broadcast({ type: 'crate-looted', playerId: p.id, crateId: crate.id, granted: w });
       return;
     }
-    if (r < 0.55) {
+    if (r < weaponChance + 0.2) {
       const guns = p.weapons.filter(w => w !== 'melee');
       const w = guns[Math.floor(Math.random() * guns.length)];
       const opts = attachmentForWeapon(w);
@@ -1209,6 +1539,20 @@ class Session {
     }
     return true;
   }
+  // Give a pile/ground-spawn's items to the picker: shared-loot squads
+  // split ammo/meds/materials, weapons always go to the picker only.
+  // Returns the split flag (true when a squad split applied).
+  giveLootItems(p, items) {
+    const split = this.splitLoot(p, items);
+    if (!split) {
+      const mult = this.lootMult(p);
+      if (items.ammo) for (const [k, v] of Object.entries(items.ammo)) p.ammo[k] = (p.ammo[k] || 0) + Math.ceil(v * mult);
+      if (items.meds) p.carried.meds = Math.min(this.maxMedsFor(p), p.carried.meds + items.meds);
+      if (items.materials) p.carried.materials += items.materials;
+    }
+    if (items.weapons) for (const w of items.weapons) this.grantWeapon(p, w);
+    return split;
+  }
   lootTick() {
     for (const p of this.alivePlayers()) {
       if (!p.interactHeld) continue;
@@ -1227,16 +1571,18 @@ class Session {
           if (pile.victimId && pile.killerId === p.id && this.nowMs - (pile.createdAtMs || 0) < 30000) {
             this.addTrust(p, TRUST.lootAfterKill, 'loot-after-kill');
           }
-          const split = this.splitLoot(p, pile.items);
-          if (!split) {
-            const mult = this.lootMult(p);
-            if (pile.items.ammo) for (const [k, v] of Object.entries(pile.items.ammo)) p.ammo[k] = (p.ammo[k] || 0) + Math.ceil(v * mult);
-            if (pile.items.meds) p.carried.meds = Math.min(this.maxMedsFor(p), p.carried.meds + pile.items.meds);
-            if (pile.items.materials) p.carried.materials += pile.items.materials;
-          }
-          // Dropped weapons go to the picker only (never split).
-          if (pile.items.weapons) for (const w of pile.items.weapons) this.grantWeapon(p, w);
+          const split = this.giveLootItems(p, pile.items);
           this.broadcast({ type: 'loot-taken', playerId: p.id, lootId: pile.id, split });
+        }
+      }
+      // BR ground spawns: fixed takeable items, finite per match — once
+      // taken, gone. Re-looting returns nothing (taken flag).
+      for (const g of this.groundLoot) {
+        if (!g.taken && dist(p.x, p.y, g.x, g.y) < 2) {
+          g.taken = true;
+          p.lootCollected++;
+          const split = this.giveLootItems(p, g.items);
+          this.broadcast({ type: 'ground-loot-taken', playerId: p.id, lootId: g.id, split });
         }
       }
     }
@@ -1270,6 +1616,26 @@ class Session {
       if (z.culled && this.tickCount % 4 !== 0) continue;
       const stepMul = z.culled ? 4 : 1;
       const base = ZOMBIE_TYPES[z.type];
+      // BR: a zombie outside the safe zone shambles toward the zone centre
+      // and takes the same zone damage as a player — it dies if it stays
+      // out too long. No zombie pile-up outside the circle.
+      if (this.mode === 'battle-royale' && this.zone) {
+        const zc = this.zone.current;
+        if (dist(z.x, z.y, zc.x, zc.y) > zc.r) {
+          const dx = zc.x - z.x, dy = zc.y - z.y, l = Math.hypot(dx, dy) || 1;
+          z.x += (dx / l) * z.speed * TICK * stepMul;
+          z.y += (dy / l) * z.speed * TICK * stepMul;
+          z.x = clamp(z.x, arena.ZOMBIE_BOUNDS.minX, arena.ZOMBIE_BOUNDS.maxX);
+          z.y = clamp(z.y, arena.ZOMBIE_BOUNDS.minY, arena.ZOMBIE_BOUNDS.maxY);
+          const c = arena.resolveCollision(z.x, z.y, 0.4);
+          z.x = c.x; z.y = c.y;
+          z.history.push({ tick: this.tickCount, x: z.x, y: z.y });
+          if (z.history.length > HISTORY_TICKS) z.history.shift();
+          z.version++;
+          this.damageZombie(z, this.zone.dps * TICK, null);
+          continue;
+        }
+      }
       // Screamer: scream on sighting (range 15), 2s channel -> surge unless killed.
       if (base.screams && !z.screamed && nearestD < 15) {
         z.screamed = true; z.screamUntil = this.nowMs + 2000; z.state = 'screaming';
@@ -1576,8 +1942,12 @@ class Session {
     this.reviveTick();
     this.lootTick();
     this.directorTick();
-    // Wave / breather state machine.
-    if (this.phase === 'breather' && this.nowMs >= this.breatherEndsAt) {
+    // BR: the zone is the clock — zone advance + zone-paced director.
+    // Survival keeps its breather/wave state machine exactly as Phase 1/2.
+    if (this.mode === 'battle-royale') {
+      this.zoneTick();
+      this.brDirectorTick();
+    } else if (this.phase === 'breather' && this.nowMs >= this.breatherEndsAt) {
       this.startWave(this.wave + 1);
     } else if (this.phase === 'wave') {
       // Spawn pacing: interval shrinks with wave, director eases near wipe.
@@ -1609,6 +1979,7 @@ class Session {
       }
     }
     this.zombieTick();
+    if (this.mode === 'battle-royale') this.checkBRWin();
     this.checkWipe();
   }
 
@@ -1655,8 +2026,26 @@ class Session {
       z.lastHitTick = this.tickCount;
     }
     const events = p.events ? p.events.splice(0, p.events.length) : [];
+    // BR zone state for the snapshot (null in Survival). msToNext is the
+    // countdown to the next transition (wait end / shrink end); null in the
+    // final circle, which holds forever.
+    let zone = null;
+    if (this.mode === 'battle-royale' && this.zone) {
+      const z = this.zone;
+      const msToNext = z.state === 'waiting'
+        ? (z.phase >= BR_ZONE_SCHEDULE.length - 1 ? null : Math.max(0, z.phaseEndsAt - this.nowMs))
+        : Math.max(0, z.shrinkEndsAt - this.nowMs);
+      zone = {
+        phase: z.phase, phases: BR_ZONE_SCHEDULE.length, state: z.state,
+        current: { x: +z.current.x.toFixed(2), y: +z.current.y.toFixed(2), r: +z.current.r.toFixed(2) },
+        next: z.next ? { x: z.next.x, y: z.next.y, r: z.next.r } : null,
+        msToNext, dps: z.dps,
+      };
+    }
     return {
       type: 'snapshot', tick: this.tickCount, code: this.code,
+      mode: this.mode,
+      zone,
       players, zombies,
       wave: {
         number: this.wave, phase: this.phase,
@@ -1668,6 +2057,8 @@ class Session {
       },
       loot: this.lootPiles.filter(l => !l.taken).map(l => ({ id: l.id, x: +l.x.toFixed(1), y: +l.y.toFixed(1) })),
       crates: this.crates.map(c => ({ id: c.id, x: c.x, y: c.y, looted: c.looted })),
+      // BR ground spawns (empty in Survival): fixed items, taken flag.
+      groundLoot: this.groundLoot.map(g => ({ id: g.id, x: g.x, y: g.y, tier: g.tier, taken: g.taken, items: g.items })),
       // Phase 2: the requester's own squad only (waypoints are members-only),
       // plus world barricades and traps (visible to everyone).
       squad: squad ? { id: squad.id, leaderId: squad.leaderId, members: [...squad.members], lootSplit: squad.lootSplit, waypoint: squad.waypoint } : null,
@@ -1712,7 +2103,11 @@ function globalTick() {
 // Default session (Phase 0 compat): a plain connect without create/join
 // lands in a shared default session so the Phase 0 two-client test still passes.
 function defaultSession() {
-  for (const s of sessions.values()) if (s.code === 'DFLT') return s;
+  for (const s of sessions.values()) {
+    if (s.code !== 'DFLT') continue;
+    if (s.ended) break; // ended default: replace with a fresh session below
+    return s;
+  }
   const s = new Session('DFLT');
   sessions.set('DFLT', s);
   return s;
@@ -1721,6 +2116,7 @@ function defaultSession() {
 function sendWelcome(ws, session, player) {
   ws.send(JSON.stringify({
     type: 'welcome', id: player.id, code: session.code,
+    mode: session.mode,
     x: player.x, y: player.y, color: player.color,
     players: [...session.players.values()].map(p => ({ id: p.id, x: p.x, y: p.y, color: p.color, hp: p.hp, state: p.state })),
     wave: { number: session.wave, phase: session.phase },
@@ -1785,8 +2181,9 @@ const server = http.createServer((req, res) => {
       zombies: totalZombies(), tick: tickCount, avgTickMs: Number(avgTickMs().toFixed(3)),
       bytesSent, bytesReceived, uptimeSec: Number(((Date.now() - startedAt) / 1000).toFixed(1)),
       sessionsDetail: [...sessions.values()].map(s => ({
-        code: s.code, players: s.players.size, zombies: s.zombies.size,
+        code: s.code, mode: s.mode, players: s.players.size, zombies: s.zombies.size,
         wave: s.wave, phase: s.phase, hibernating: s.hibernating,
+        zonePhase: s.zone ? s.zone.phase : null,
       })),
       anomalies: anomalies.slice(-20),
     }));
@@ -1812,14 +2209,14 @@ wss.on('connection', (ws) => {
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
     if (msg.type === 'create') {
       const code = makeCode();
-      const sess = new Session(code, { maxPlayers: msg.maxPlayers || MAX_PLAYERS_DEFAULT });
+      const sess = new Session(code, { maxPlayers: msg.maxPlayers || MAX_PLAYERS_DEFAULT, mode: msg.mode });
       sessions.set(code, sess);
       // Move this player from the default session into the new one.
       if (player) session.players.delete(player.id);
       const r = sess.addPlayer(ws);
       if (r.error) { ws.send(JSON.stringify({ type: 'error', error: r.error })); return; }
       player = r.player; session = sess;
-      ws.send(JSON.stringify({ type: 'created', code, id: player.id }));
+      ws.send(JSON.stringify({ type: 'created', code, id: player.id, mode: sess.mode }));
       sendWelcome(ws, sess, player);
       return;
     }
@@ -1866,4 +2263,8 @@ module.exports = {
   ROLES, ROLE_NAMES, XP_VALUES, XP_PER_LEVEL, PERK_LIST, PERK_DESC, TRUST,
   trustRank, bountyFor, SQUAD_MAX, BARRICADE_HP, BARRICADE_COST,
   BARRICADE_BUILD_MS, BARRICADE_CAP, TRAP_STATS, attachmentForWeapon,
+  // Phase 3 exports (Battle Royale: zone, loot, director).
+  BR_ZONE_SCHEDULE, BR_ZONE_TOTAL_MS, BR_ZONE_PHASES, BR_ZONE_CENTRE,
+  computeNextZone, BR_DROP_POINTS, BR_MIN_SPAWN_DIST,
+  BR_GROUND_LOOT, BR_CRATE_TIER, crateWeaponChance, BR_DIRECTOR, brMixPick,
 };
