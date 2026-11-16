@@ -103,7 +103,7 @@ function unitTests() {
     for (let i = 0; i < ps.length; i++) for (let j = i + 1; j < ps.length; j++) min = Math.min(min, dist2(ps[i], ps[j]));
     return min >= BR_MIN_SPAWN_DIST;
   })(), `min pairwise ${(() => { const { ps } = brSession(8); let m = Infinity; for (let i = 0; i < ps.length; i++) for (let j = i + 1; j < ps.length; j++) m = Math.min(m, dist2(ps[i], ps[j])); return m.toFixed(2); })()}`);
-  check('all BR drop points in-bounds (x 0..30, y 14..30)', BR_DROP_POINTS.every(p => p.x >= 0 && p.x <= 30 && p.y >= 14 && p.y <= 30));
+  check('all BR drop points in-bounds (x 0..30, y 0..30)', BR_DROP_POINTS.every(p => p.x >= 0 && p.x <= 30 && p.y >= 0 && p.y <= 30));
   check('all BR drop points on walkable tiles', BR_DROP_POINTS.every(p => !arena.tileBlocked(Math.floor(p.x), Math.floor(p.y))));
   check('BR drop-in is melee-only (no gun, no ammo)', (() => {
     const { ps } = brSession(2);
@@ -148,14 +148,14 @@ function unitTests() {
   })(), 'zombie hit a graced player');
 
   console.log('\n--- unit: BR loot (Job 3.2) ---');
-  check('BR has 10 crates + 12 ground spawns = 22 loot points', (() => {
+  check('BR has 14 crates + 16 ground spawns = 30 loot points', (() => {
     const { s } = brSession(1);
-    return s.crates.length === 10 && s.groundLoot.length === 12;
+    return s.crates.length === 14 && s.groundLoot.length === 16;
   })());
   check('ground loot tier audit: no low-tier spawn holds a rifle/shotgun/SMG', BR_GROUND_LOOT.filter(g => g.tier === 'low').every(g => !(g.items.weapons || []).some(w => ['rifle', 'shotgun', 'smg'].includes(w))));
   check('ground loot tier audit: every high-tier spawn holds a gun or 2+ meds', BR_GROUND_LOOT.filter(g => g.tier === 'high').every(g => (g.items.weapons || []).some(w => ['rifle', 'shotgun', 'smg'].includes(w)) || (g.items.meds || 0) >= 2));
-  check('all ground spawns on walkable in-bounds tiles', BR_GROUND_LOOT.every(g => g.x >= 0 && g.x <= 30 && g.y >= 14 && g.y <= 30 && !arena.tileBlocked(Math.floor(g.x), Math.floor(g.y))));
-  check('crate tier table covers all 10 crates', Object.keys(BR_CRATE_TIER).length === 10 && ['crate-1', 'crate-2', 'crate-3', 'crate-4', 'crate-5', 'crate-6', 'crate-7', 'crate-8', 'crate-9', 'crate-10'].every(id => BR_CRATE_TIER[id]));
+  check('all ground spawns on walkable in-bounds tiles', BR_GROUND_LOOT.every(g => g.x >= 0 && g.x <= 30 && g.y >= 0 && g.y <= 30 && !arena.tileBlocked(Math.floor(g.x), Math.floor(g.y))));
+  check('crate tier table covers all 14 crates', Object.keys(BR_CRATE_TIER).length === 14 && ['crate-1', 'crate-2', 'crate-3', 'crate-4', 'crate-5', 'crate-6', 'crate-7', 'crate-8', 'crate-9', 'crate-10', 'crate-11', 'crate-12', 'crate-13', 'crate-14'].every(id => BR_CRATE_TIER[id]));
   check('crate weapon chance is tiered in BR (high 0.5 / mid 0.35 / low 0.2)', crateWeaponChance('battle-royale', 'high') === 0.5 && crateWeaponChance('battle-royale', 'mid') === 0.35 && crateWeaponChance('battle-royale', 'low') === 0.2);
   check('crate weapon chance is flat 0.35 in Survival (regression)', crateWeaponChance('survival', 'high') === 0.35 && crateWeaponChance('survival', 'low') === 0.35);
   check('ground spawn is finite: taken once, second player gets nothing', (() => {
@@ -208,36 +208,37 @@ function unitTests() {
 
   console.log('\n--- unit: zone schedule (Job 3.3) ---');
   check('zone has 6 phases (0..5)', BR_ZONE_PHASES === 6 && BR_ZONE_SCHEDULE.length === 6);
-  check('zone radii shrink monotonically (18, 13, 9.5, 6.5, 4, 2.5)', JSON.stringify(BR_ZONE_SCHEDULE.map(z => z.radius)) === JSON.stringify([18, 13, 9.5, 6.5, 4, 2.5]));
+  check('zone radii shrink monotonically (22, 16, 12, 8, 5, 2.5)', JSON.stringify(BR_ZONE_SCHEDULE.map(z => z.radius)) === JSON.stringify([22, 16, 12, 8, 5, 2.5]));
   check('zone DPS rises monotonically per phase (1, 2, 4, 8, 15, 25)', JSON.stringify(BR_ZONE_SCHEDULE.map(z => z.dps)) === JSON.stringify([1, 2, 4, 8, 15, 25]));
   check('zone schedule to final circle is 460 s (8–10 min window)', BR_ZONE_TOTAL_MS === 460000 && BR_ZONE_TOTAL_MS >= 420000 && BR_ZONE_TOTAL_MS <= 600000, `${BR_ZONE_TOTAL_MS} ms`);
   check('every phase has a ~30 s shrink period', BR_ZONE_SCHEDULE.slice(0, 5).every(z => z.shrinkMs === 30000));
   check('every phase wait is 50–90 s', BR_ZONE_SCHEDULE.slice(0, 5).every(z => z.waitMs >= 50000 && z.waitMs <= 90000));
-  check('phase 0 circle covers the whole arena (centre 15,22 r18)', (() => {
+  check('phase 0 circle covers the whole arena (centre 15,15 r22)', (() => {
     const c = BR_ZONE_CENTRE;
-    return Math.hypot(0 - c.x, 14 - c.y) <= 18 && Math.hypot(30 - c.x, 30 - c.y) <= 18;
+    return Math.hypot(0 - c.x, 0 - c.y) <= 22 && Math.hypot(30 - c.x, 0 - c.y) <= 22
+      && Math.hypot(0 - c.x, 30 - c.y) <= 22 && Math.hypot(30 - c.x, 30 - c.y) <= 22;
   })());
   check('next-zone centres are never concentric (min shift 1.5 tiles)', (() => {
     let ok = true;
     for (let i = 0; i < 50; i++) {
-      const cur = { x: 15 + (Math.random() * 4 - 2), y: 22 + (Math.random() * 4 - 2), r: 13 };
-      const nxt = computeNextZone(cur, 9.5);
+      const cur = { x: 15 + (Math.random() * 4 - 2), y: 15 + (Math.random() * 4 - 2), r: 16 };
+      const nxt = computeNextZone(cur, 12);
       if (Math.hypot(nxt.x - cur.x, nxt.y - cur.y) < 1.5) ok = false;
     }
     return ok;
   })());
   check('next-zone circle stays inside the arena as far as it can fit', (() => {
-    // The arena is 30 wide x 16 tall: a circle fits fully only for r<=8.
-    // Rule: centre inside the arena rect, and fully contained when r<=8.
+    // The arena is a 30x30 square: a circle fits fully for r<=15.
+    // Rule: centre inside the arena rect, and fully contained when r<=15.
     for (let i = 0; i < 50; i++) {
-      const cur = { x: 10 + Math.random() * 10, y: 18 + Math.random() * 8, r: 13 };
-      const nxt = computeNextZone(cur, 9.5);
-      if (nxt.x < 0 || nxt.x > 30 || nxt.y < 14 || nxt.y > 30) return false;
+      const cur = { x: 10 + Math.random() * 10, y: 10 + Math.random() * 10, r: 16 };
+      const nxt = computeNextZone(cur, 12);
+      if (nxt.x < 0 || nxt.x > 30 || nxt.y < 0 || nxt.y > 30) return false;
     }
     for (let i = 0; i < 50; i++) {
-      const cur = { x: 12 + Math.random() * 6, y: 19 + Math.random() * 6, r: 6.5 };
-      const nxt = computeNextZone(cur, 4);
-      if (nxt.x - nxt.r < 0 || nxt.x + nxt.r > 30 || nxt.y - nxt.r < 14 || nxt.y + nxt.r > 30) return false;
+      const cur = { x: 12 + Math.random() * 6, y: 12 + Math.random() * 6, r: 8 };
+      const nxt = computeNextZone(cur, 5);
+      if (nxt.x - nxt.r < 0 || nxt.x + nxt.r > 30 || nxt.y - nxt.r < 0 || nxt.y + nxt.r > 30) return false;
     }
     return true;
   })());
@@ -260,20 +261,20 @@ function unitTests() {
     if (s.zone.state !== 'shrinking') return false;
     tickN(s, 300); // 15 s into the 30 s shrink
     const r = s.zone.current.r;
-    return r < 18 && r > 13;
+    return r < 22 && r > 16;
   })());
 
   console.log('\n--- unit: zone damage (Job 3.3) ---');
   // Helper: a BR session with the zone pinned to one phase, one player
-  // standing outside it at (29.5, 15.5) — walkable, 15.9 tiles from (15,22).
+  // standing outside it at (29.5, 29.5) — walkable, 20.5 tiles from (15,15).
   function zoneDpsSetup(phase) {
     const { s, ps } = brSession(2, false);
     const p = ps[0];
     god(ps[1]); // the other player must not die mid-test (a BR win would freeze the tick)
     p.invulnUntil = Infinity; // isolate zone damage from zombie hits
     p.hp = 100; p.maxHp = 100;
-    p.x = 29.5; p.y = 15.5;
-    s.zone.current = { x: 15, y: 22, r: BR_ZONE_SCHEDULE[phase].radius };
+    p.x = 29.5; p.y = 29.5;
+    s.zone.current = { x: 15, y: 15, r: BR_ZONE_SCHEDULE[phase].radius };
     s.zone.phase = phase;
     s.zone.dps = BR_ZONE_SCHEDULE[phase].dps;
     s.zone.state = 'waiting';
@@ -303,7 +304,7 @@ function unitTests() {
   })());
   check('player inside the zone takes no zone damage', (() => {
     const { s, p } = zoneDpsSetup(4);
-    p.x = 15; p.y = 22; // dead centre of the r=4 circle
+    p.x = 15; p.y = 15; // dead centre of the r=5 circle
     tickN(s, 100);
     return p.hp === 100;
   })());
@@ -344,11 +345,11 @@ function unitTests() {
       return true;
     })());
     check('every previewed circle stays inside the arena as far as it can fit', (() => {
-      // Centre inside the arena rect; fully contained when r<=8 (a bigger
-      // circle cannot fit the 16-tall arena — see computeNextZone).
+      // Centre inside the arena rect; fully contained when r<=15 (a bigger
+      // circle cannot fit the 30x30 arena — see computeNextZone).
       return previews.every(p => !p.next ||
-        (p.next.x >= 0 && p.next.x <= 30 && p.next.y >= 14 && p.next.y <= 30 &&
-          (p.next.r > 8 || (p.next.x - p.next.r >= 0 && p.next.x + p.next.r <= 30 && p.next.y - p.next.r >= 14 && p.next.y + p.next.r <= 30))));
+        (p.next.x >= 0 && p.next.x <= 30 && p.next.y >= 0 && p.next.y <= 30 &&
+          (p.next.r > 15 || (p.next.x - p.next.r >= 0 && p.next.x + p.next.r <= 30 && p.next.y - p.next.r >= 0 && p.next.y + p.next.r <= 30))));
     })());
     check('final phase has no next circle (holds forever)', s.zone.next === null && s.zone.state === 'waiting');
     check('snapshot carries current + next zone with countdown', (() => {
@@ -367,19 +368,19 @@ function unitTests() {
   check('a zombie outside the zone takes zone damage and moves to centre', (() => {
     const { s, ps } = brSession(2, false);
     god(ps[0]); god(ps[1]);
-    s.zone.current = { x: 15, y: 22, r: 4 };
+    s.zone.current = { x: 15, y: 15, r: 4 };
     s.zone.phase = 4; s.zone.dps = 15; s.zone.state = 'waiting'; s.zone.phaseEndsAt = Infinity;
     const z = zombieNear(s, 'shambler', 25, 25); // 14.1 tiles from centre, outside r=4
-    const d0 = Math.hypot(z.x - 15, z.y - 22);
+    const d0 = Math.hypot(z.x - 15, z.y - 15);
     const hp0 = z.hp;
     tickN(s, 20); // 1 s: 15 zone damage, shambles toward centre
-    const d1 = Math.hypot(z.x - 15, z.y - 22);
+    const d1 = Math.hypot(z.x - 15, z.y - 15);
     return z.hp < hp0 && d1 < d0;
   })());
   check('a zombie left outside the zone dies if it stays out too long', (() => {
     const { s, ps } = brSession(2, false);
     god(ps[0]); god(ps[1]);
-    s.zone.current = { x: 15, y: 22, r: 4 };
+    s.zone.current = { x: 15, y: 15, r: 4 };
     s.zone.phase = 4; s.zone.dps = 15; s.zone.state = 'waiting'; s.zone.phaseEndsAt = Infinity;
     const z = zombieNear(s, 'shambler', 25, 25);
     z.hp = 5; // one second of phase-4 zone damage kills it
@@ -389,7 +390,7 @@ function unitTests() {
   })());
   check('no zombie pile-up outside the circle (30 s run, phase 3)', (() => {
     const { s } = brSession(2);
-    s.zone.current = { x: 15, y: 22, r: 6.5 };
+    s.zone.current = { x: 15, y: 15, r: 8 };
     s.zone.phase = 3; s.zone.dps = 8; s.zone.state = 'waiting'; s.zone.phaseEndsAt = Infinity;
     tickN(s, 600);
     const z = s.zone.current;
@@ -415,10 +416,10 @@ function unitTests() {
     const countSpawns = (phase) => {
       const { s, ps } = brSession(2);
       s.zone.phase = phase;
-      s.zone.current = { x: 15, y: 22, r: phase === 5 ? 2.5 : 18 };
+      s.zone.current = { x: 15, y: 15, r: phase === 5 ? 2.5 : 22 };
       // Players together at the centre: no isolated-player pressure
       // spawns. Surges blocked: this measures the base director rate only.
-      ps[0].x = 15; ps[0].y = 22; ps[1].x = 15.5; ps[1].y = 22;
+      ps[0].x = 15; ps[0].y = 15; ps[1].x = 15.5; ps[1].y = 15;
       s.director.lastSurgeTick = 1e9;
       tickN(s, 600); // 30 s
       return s.zombies.size;
@@ -557,7 +558,7 @@ function unitTests() {
     god(b);
     a.hp = 100; a.maxHp = 100; a.invulnUntil = Infinity;
     a.x = 29.5; a.y = 15.5; // outside the phase-4 circle
-    s.zone.current = { x: 15, y: 22, r: 4 };
+    s.zone.current = { x: 15, y: 15, r: 4 };
     s.zone.phase = 4; s.zone.dps = 15; s.zone.state = 'waiting'; s.zone.phaseEndsAt = Infinity;
     a.disconnected = true; a.disconnectAtMs = s.nowMs;
     tickN(s, 20); // 1 s: 15 zone damage while disconnected
@@ -569,7 +570,7 @@ function unitTests() {
     // Both disconnected: no win check (hibernation guard), bleed-out runs.
     a.hp = 100; a.maxHp = 100; a.invulnUntil = Infinity;
     a.x = 29.5; a.y = 15.5;
-    s.zone.current = { x: 15, y: 22, r: 2.5 };
+    s.zone.current = { x: 15, y: 15, r: 2.5 };
     s.zone.phase = 5; s.zone.dps = 25; s.zone.state = 'waiting'; s.zone.phaseEndsAt = Infinity;
     a.disconnected = true; a.disconnectAtMs = s.nowMs;
     b.disconnected = true; b.disconnectAtMs = s.nowMs;
@@ -593,7 +594,7 @@ function unitTests() {
   console.log('\n--- unit: Survival regression (Phases 1–2 unchanged) ---');
   check('Survival: breather leads into wave 1', (() => {
     const s = new Session('SV1'); addFake(s);
-    tickN(s, 650); // 32.5 s > 30 s breather
+    tickN(s, 950); // 47.5 s > 45 s first breather (v7)
     return s.phase === 'wave' && s.wave === 1 && s.waveRemainingToSpawn > 0;
   })());
   check('Survival: clearing a wave returns to breather', (() => {
@@ -608,7 +609,7 @@ function unitTests() {
     tickN(s, 2);
     return s.extractionOpen === true;
   })());
-  check('Survival: wave-paced director unchanged (waveCount/waveDef values)', waveCount(1, 1) === 14 && waveCount(1, 4) === 29 && waveDef(1).gates === 1 && waveDef(3).mix.spitter === 0.1 && waveDef(3).mix.screamer === 0.05 && waveDef(5).mix.brute === 0.1);
+  check('Survival: wave-paced director unchanged (waveCount/waveDef values)', waveCount(1, 1) === 8 && waveCount(1, 4) === 16 && waveDef(1).gates === 1 && waveDef(3).mix.spitter === 0.1 && waveDef(3).mix.screamer === 0.05 && waveDef(5).mix.brute === 0.1);
   check('Survival: no zone, no ground loot, no BR win logic', (() => {
     const s = new Session('SV4'); const p = addFake(s);
     tickN(s, 100);
@@ -678,7 +679,7 @@ async function wsTests() {
   check('WS: second client joins the BR session by code', joined && joined.code === created.code, JSON.stringify(joined));
   await wait(600);
   const snapA = lastSnap(a), snapB = lastSnap(b);
-  check('WS: snapshots carry mode battle-royale + a zone', snapA && snapA.mode === 'battle-royale' && snapA.zone && snapA.zone.phase === 0 && snapA.zone.current.r === 18, JSON.stringify(snapA && snapA.zone));
+  check('WS: snapshots carry mode battle-royale + a zone', snapA && snapA.mode === 'battle-royale' && snapA.zone && snapA.zone.phase === 0 && snapA.zone.current.r === 22, JSON.stringify(snapA && snapA.zone));
   check('WS: both players drop in melee-only over the wire', (() => {
     const pa = snapA && snapA.players.find(p => p.id === a.id);
     const pb = snapB && snapB.players.find(p => p.id === b.id);
@@ -693,7 +694,7 @@ async function wsTests() {
     const pb = lastSnap(a).players.find(p => p.id === b.id);
     return `A=(${pa.x},${pa.y}) B=(${pb.x},${pb.y}) dist=${Math.hypot(pa.x - pb.x, pa.y - pb.y).toFixed(2)}`;
   })());
-  check('WS: snapshot carries BR ground loot (12 spawns)', snapA && Array.isArray(snapA.groundLoot) && snapA.groundLoot.length === 12, `groundLoot=${snapA && snapA.groundLoot.length}`);
+  check('WS: snapshot carries BR ground loot (16 spawns)', snapA && Array.isArray(snapA.groundLoot) && snapA.groundLoot.length === 16, `groundLoot=${snapA && snapA.groundLoot.length}`);
   // Role pick over the wire in BR: Heavy grants the passive, not a shotgun.
   a.ws.send(JSON.stringify({ type: 'role', role: 'heavy' }));
   await wait(400);

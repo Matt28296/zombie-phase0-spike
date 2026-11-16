@@ -26,7 +26,8 @@
 //
 // Minimal input protocol (Matt's direction: simple controls, no 22 keybinds):
 //   {type:'input', seq, keys:{up,down,left,right}, aim:{x,y}|angle,
-//    fire:bool, jump:bool, dodge:bool, reload:bool, interact:bool}
+//    fire:bool, jump:bool, dodge:bool, reload:bool, interact:bool,
+//    moveMag?:number 0..1 — analog stick magnitude (v7); absent = 1}
 // Legacy Phase 0 input {keys} still works. Clients never send positions,
 // damage, kills or loot claims — those are ignored + logged (anti-cheat floor).
 //
@@ -59,6 +60,7 @@ const REVIVE_SECONDS = 3;
 const DISCONNECT_GRACE_MS = 30 * 1000;
 const HIBERNATE_MS = 5 * 60 * 1000;
 const BREATHER_SECONDS = 30;      // 30-45s per spec; simple fixed 30s
+const FIRST_BREATHER_SECONDS = 45; // first breather only (v7): new players need time to learn the controls + loot before wave 1
 const EXTRACTION_SECONDS = 30;
 const EXTRACTION_WAVE = 5;
 const MAX_SPEED_TOLERANCE = 2.0;  // movement validation multiplier
@@ -148,7 +150,9 @@ const ELITES = {
 // ---- Waves (Task 1.4.4): count, mix, gates. Wave 1 = Shamblers, 1 gate. ----
 // Base count is for a solo player; scaled by players alive (see waveCount()).
 function waveDef(n) {
-  const count = 8 + 6 * n;
+  // v7 tuning: wave 1 is onboarding — 8 shamblers, not 14 (a full wave-1
+  // horde killed a stationary new player in ~15 s). Waves 2+ unchanged.
+  const count = n === 1 ? 8 : 8 + 6 * n;
   const mix = { shambler: 1 };
   if (n >= 2) { mix.shambler = 0.7; mix.runner = 0.3; }
   if (n >= 3) { mix.shambler = 0.55; mix.runner = 0.3; mix.spitter = 0.1; mix.screamer = 0.05; }
@@ -162,8 +166,9 @@ function waveCount(n, playersAlive) {
   return Math.round(waveDef(n).count * (1 + 0.35 * Math.max(0, playersAlive - 1)));
 }
 
-// ---- Battle Royale (Phase 3, spec §2.7; map scope: verified Gate Town
-// arena only — x 0..30, y 14..30. Full-map BR is a Phase 4 job.) ----
+// ---- Battle Royale (Phase 3, spec §2.7; map scope: FULL Gate Town —
+// x 0..30, y 0..30, expanded 2026-11-16. Full 60x60-map BR is a
+// Phase 4 job.) ----
 // Zone schedule: 6 phases (0 = full-arena circle, 5 = final small circle).
 // Each phase = wait (circle holds, next circle previewed) + shrink (~30 s).
 // Total zone time to the final circle: 460 s (~7.7 min); with drop-in +
@@ -171,33 +176,33 @@ function waveCount(n, playersAlive) {
 // DPS rises per phase: early phases forgive a slow rotate, the final
 // phase (25 HP/s) kills a full-HP player in 4 s.
 const BR_ZONE_SCHEDULE = [
-  { phase: 0, radius: 18,   waitMs: 75000, shrinkMs: 30000, dps: 1 },
-  { phase: 1, radius: 13,   waitMs: 70000, shrinkMs: 30000, dps: 2 },
-  { phase: 2, radius: 9.5,  waitMs: 60000, shrinkMs: 30000, dps: 4 },
-  { phase: 3, radius: 6.5,  waitMs: 55000, shrinkMs: 30000, dps: 8 },
-  { phase: 4, radius: 4,    waitMs: 50000, shrinkMs: 30000, dps: 15 },
+  { phase: 0, radius: 22,   waitMs: 75000, shrinkMs: 30000, dps: 1 },
+  { phase: 1, radius: 16,   waitMs: 70000, shrinkMs: 30000, dps: 2 },
+  { phase: 2, radius: 12,   waitMs: 60000, shrinkMs: 30000, dps: 4 },
+  { phase: 3, radius: 8,    waitMs: 55000, shrinkMs: 30000, dps: 8 },
+  { phase: 4, radius: 5,    waitMs: 50000, shrinkMs: 30000, dps: 15 },
   { phase: 5, radius: 2.5,  waitMs: Infinity, shrinkMs: 0,  dps: 25 },
 ];
 const BR_ZONE_TOTAL_MS = BR_ZONE_SCHEDULE.slice(0, 5).reduce((s, ph) => s + ph.waitMs + ph.shrinkMs, 0); // 460000
-const BR_ZONE_CENTRE = { x: 15, y: 22 }; // arena centre; r=18 covers every corner (17.0 to (0,14)/(30,30))
+const BR_ZONE_CENTRE = { x: 15, y: 15 }; // town centre; r=22 covers every corner (21.2 to (0,0)/(30,30))
 const BR_ZONE_PHASES = BR_ZONE_SCHEDULE.length;
 
 // Next-zone centre: random point inside the current circle, at least 1.5
 // tiles from the current centre (successive circles are NEVER concentric —
 // camping the middle is not a strategy), constrained so the whole next
-// circle stays inside the arena bounds (x 0..30, y 14..30).
+// circle stays inside the arena bounds (x 0..30, y 0..30).
 function computeNextZone(current, nextRadius) {
   // Centre bounds: the circle stays inside the arena when it CAN fit.
-  // The arena is 30 wide x 16 tall, so a circle fits fully only for r<=8
-  // (vertically) / r<=15 (horizontally). For larger radii the centre is
-  // clamped to the arena rect itself — the circle still covers the arena
-  // (a r=13 circle centred in the rect covers y 14..30 from any centre
-  // y in 14..30 only when centred near 22, which the shift rule below
-  // already guarantees: the next centre stays near the current one).
+  // The arena is a 30x30 square, so a circle fits fully for r<=15 on
+  // both axes. For larger radii the centre is clamped to the arena rect
+  // itself — the circle still covers the arena (a r=16 circle centred in
+  // the rect covers y 0..30 from any centre y in 0..30 only when centred
+  // near 15, which the shift rule below already guarantees: the next
+  // centre stays near the current one).
   const minX = nextRadius <= 15 ? nextRadius : 0;
   const maxX = nextRadius <= 15 ? 30 - nextRadius : 30;
-  const minY = nextRadius <= 8 ? 14 + nextRadius : 14;
-  const maxY = nextRadius <= 8 ? 30 - nextRadius : 30;
+  const minY = nextRadius <= 15 ? nextRadius : 0;
+  const maxY = nextRadius <= 15 ? 30 - nextRadius : 30;
   const maxShift = Math.max(0, (current.r - nextRadius) * 0.7);
   for (let attempt = 0; attempt < 12; attempt++) {
     const ang = Math.random() * Math.PI * 2;
@@ -217,20 +222,23 @@ function computeNextZone(current, nextRadius) {
   return { x: +cx.toFixed(2), y: +cy.toFixed(2), r: nextRadius };
 }
 
-// BR drop points: 8 spread points, pairwise >= 5 tiles, all on walkable
-// in-bounds tiles (checked against arena.tileBlocked by test-phase3.js).
-// The 6 Survival spawns are too close together (min 3.16) for BR.
+// BR drop points: 8 spread points across the FULL town, pairwise >= 5
+// tiles, all on walkable in-bounds tiles (checked against
+// arena.tileBlocked by test-phase3.js). Separate from the 6 Survival
+// spawns: BR needs 8 points (one per player) spread edge-to-edge, not
+// clustered around the plaza.
 const BR_DROP_POINTS = [
-  { id: 'br-1', x: 5.5, y: 15.5 }, { id: 'br-2', x: 11.5, y: 15.5 },
-  { id: 'br-3', x: 18.5, y: 15.5 }, { id: 'br-4', x: 25.5, y: 15.5 },
-  { id: 'br-5', x: 9.5, y: 20.5 }, { id: 'br-6', x: 21.5, y: 20.5 },
-  { id: 'br-7', x: 13.5, y: 25.5 }, { id: 'br-8', x: 19.5, y: 28.5 },
+  { id: 'br-1', x: 5.5, y: 4.5 }, { id: 'br-2', x: 14.5, y: 5.5 },
+  { id: 'br-3', x: 24.5, y: 5.5 }, { id: 'br-4', x: 6.5, y: 13.5 },
+  { id: 'br-5', x: 23.5, y: 13.5 }, { id: 'br-6', x: 10.5, y: 21.5 },
+  { id: 'br-7', x: 21.5, y: 22.5 }, { id: 'br-8', x: 15.5, y: 28.5 },
 ];
 const BR_MIN_SPAWN_DIST = 5;
 
-// BR ground loot: 12 fixed takeable spawns (10 crates + 12 = 22 loot
+// BR ground loot: 16 fixed takeable spawns (14 crates + 16 = 30 loot
 // points). Tiered by risk: high = plaza/gate (guns + medkits), mid =
 // inner ring (a pistol, ammo, a med), low = edges (pistol ammo, bandages).
+// g13–g16 cover the north half (expansion 2026-11-16).
 const BR_GROUND_LOOT = [
   { id: 'g1', x: 15.5, y: 17.5, tier: 'high', items: { weapons: ['rifle'], ammo: { rifle: 40 } } },
   { id: 'g2', x: 14.5, y: 15.5, tier: 'high', items: { weapons: ['shotgun'], ammo: { shells: 24 } } },
@@ -244,12 +252,17 @@ const BR_GROUND_LOOT = [
   { id: 'g10', x: 27.5, y: 16.5, tier: 'low', items: { ammo: { pistol: 24 }, materials: 2 } },
   { id: 'g11', x: 19.5, y: 29.5, tier: 'low', items: { meds: 1, ammo: { smg: 30 } } },
   { id: 'g12', x: 7.5, y: 20.5, tier: 'low', items: { weapons: ['pistol'], ammo: { pistol: 24 } } },
+  { id: 'g13', x: 14.5, y: 6.5, tier: 'high', items: { weapons: ['rifle'], ammo: { rifle: 40 } } },
+  { id: 'g14', x: 7.5, y: 9.5, tier: 'mid', items: { weapons: ['pistol'], ammo: { pistol: 48 } } },
+  { id: 'g15', x: 23.5, y: 5.5, tier: 'mid', items: { ammo: { smg: 60 }, meds: 1 } },
+  { id: 'g16', x: 10.5, y: 3.5, tier: 'low', items: { meds: 1, ammo: { pistol: 24 } } },
 ];
 // Crate risk tiers (BR only — Survival keeps the flat 35% weapon roll).
 const BR_CRATE_TIER = {
   'crate-1': 'high', 'crate-2': 'high',
   'crate-3': 'mid', 'crate-5': 'mid', 'crate-8': 'mid',
   'crate-4': 'low', 'crate-6': 'low', 'crate-7': 'low', 'crate-9': 'low', 'crate-10': 'low',
+  'crate-11': 'low', 'crate-12': 'low', 'crate-13': 'high', 'crate-14': 'mid',
 };
 function crateWeaponChance(mode, tier) {
   if (mode !== 'battle-royale') return 0.35;
@@ -380,6 +393,7 @@ class Session {
     this.groundLoot = []; // BR fixed ground spawns (copies of BR_GROUND_LOOT, taken:false)
     this.brWinners = null; // [playerIds] set when the BR win is detected
     this.peakPlayers = 0; // most players ever in the session (BR win needs >= 2)
+    this.brStartedAt = 0; // session-clock ms when the BR zone started (v7: slow phase-0 director for the first 30 s)
     this.brDropOrder = null; // shuffled BR_DROP_POINTS, assigned in join order
   }
 
@@ -791,7 +805,7 @@ class Session {
                  : { pistol: WEAPONS.pistol.reserveStart, shells: WEAPONS.shotgun.reserveStart, rifle: WEAPONS.rifle.reserveStart, smg: WEAPONS.smg.reserveStart },
       mag: { pistol: WEAPONS.pistol.mag, shotgun: WEAPONS.shotgun.mag, rifle: WEAPONS.rifle.mag, smg: WEAPONS.smg.mag },
       reloadingUntil: 0, reloadingWeapon: null, lastShotMs: -9999, fireHeld: false,
-      aim: { x: 1, y: 0 }, keys: { up: false, down: false, left: false, right: false },
+      aim: { x: 1, y: 0 }, keys: { up: false, down: false, left: false, right: false }, moveMag: 1,
       jumpUntil: 0, dodgeUntil: 0, dodgeCdUntil: 0, invulnUntil: 0,
       reviveTarget: null, reviveProgressMs: 0, reviveNeededMs: REVIVE_SECONDS * 1000, extractingMs: 0,
       carried: { meds: 1, materials: 0 }, // carried loot: drops on death
@@ -846,12 +860,13 @@ class Session {
     }
     this.phase = 'breather';
     this.wave = 0;
-    this.breatherEndsAt = this.nowMs + BREATHER_SECONDS * 1000;
+    this.breatherEndsAt = this.nowMs + FIRST_BREATHER_SECONDS * 1000;
     this.broadcast({ type: 'session-start', code: this.code });
   }
 
   // ---- Battle Royale: zone, zone-paced director, win detection ----
   initZone() {
+    this.brStartedAt = this.nowMs;
     this.zone = {
       phase: 0,
       current: { x: BR_ZONE_CENTRE.x, y: BR_ZONE_CENTRE.y, r: BR_ZONE_SCHEDULE[0].radius },
@@ -918,8 +933,11 @@ class Session {
     if (this.mode !== 'battle-royale' || !this.zone || this.ended) return;
     if (!this.alivePlayers().length) return; // nobody to hunt — don't stockpile
     const def = BR_DIRECTOR[this.zone.phase];
+    // v7: phase 0 is loot time — the director spawns 1/4 s for the first
+    // 30 s (a melee-only player took first damage at ~8 s at 1/2.5 s).
+    const intervalMs = (this.zone.phase === 0 && this.nowMs - this.brStartedAt < 30000) ? 4000 : def.intervalMs;
     this.spawnTimerMs += TICK_MS;
-    if (this.spawnTimerMs >= def.intervalMs) {
+    if (this.spawnTimerMs >= intervalMs) {
       this.spawnTimerMs = 0;
       const pos = this.zoneSpawnPoint();
       if (pos) this.spawnZombieAt(brMixPick(def.mix), pos.x, pos.y);
@@ -927,17 +945,24 @@ class Session {
     this.drainQueue();
   }
   // Spawn point inside the current safe zone, at its edges (0.7–0.95 r),
-  // on a walkable tile, >= 6 tiles from any living player when possible.
+  // on a walkable tile. v7: pass 0 = >= 6 tiles from any living player
+  // (30 tries, was 10 — a zombie spawned 3.1 tiles from a fresh drop).
+  // Pass 1 = >= 3 tiles (hard floor — never spawn on top of a player),
+  // but only when the circle is big enough to allow it (r >= 6); in a
+  // tiny final circle there's nowhere far to spawn. If neither finds a
+  // spot, return null and skip this spawn tick.
   zoneSpawnPoint() {
     const z = this.zone.current;
     for (let pass = 0; pass < 2; pass++) {
-      for (let i = 0; i < 10; i++) {
+      const tries = pass === 0 ? 30 : 10;
+      const minD = pass === 0 ? 6 : (z.r >= 6 ? 3 : 0);
+      for (let i = 0; i < tries; i++) {
         const ang = Math.random() * Math.PI * 2;
         const rr = z.r * (0.7 + Math.random() * 0.25);
         const x = z.x + Math.cos(ang) * rr, y = z.y + Math.sin(ang) * rr;
-        if (x < 0 || x > 30 || y < 14 || y > 30) continue;
+        if (x < 0 || x > 30 || y < 0 || y > 30) continue;
         if (arena.tileBlocked(Math.floor(x), Math.floor(y))) continue;
-        if (pass === 0 && [...this.players.values()].some(p => p.state === 'alive' && dist(x, y, p.x, p.y) < 6)) continue;
+        if (minD > 0 && [...this.players.values()].some(p => p.state === 'alive' && dist(x, y, p.x, p.y) < minD)) continue;
         return { x: +x.toFixed(2), y: +y.toFixed(2) };
       }
     }
@@ -955,7 +980,13 @@ class Session {
     const alive = [...this.players.values()].filter(standing);
     if (!alive.length) { this.endSession('wipe'); return; }
     const units = new Set(alive.map(p => p.squadId || `solo:${p.id}`));
-    if (units.size === 1) {
+    // v7: a win needs combat to have happened — two friends forming a squad
+    // in an otherwise empty lobby won instantly (1 unit, 0 downs/deaths).
+    // Units only legitimately drop to 1 by elimination (downed or dead),
+    // not by merging. A downed player with a living squadmate still counts
+    // as standing, so a revivable squadmate never triggers this alone.
+    const combatHappened = this.deathSeq > 0 || [...this.players.values()].some(p => p.timesDowned > 0);
+    if (units.size === 1 && combatHappened) {
       this.brWinners = alive.map(p => p.id);
       this.endSession('br-win');
     }
@@ -1059,7 +1090,10 @@ class Session {
     // wave 1; the director pushes, it does not flood). In BR the director
     // runs continuously (phase 'br'), paced by the zone instead of waves.
     const inCombat = this.phase === 'wave' || this.mode === 'battle-royale';
-    if (!nearWipe && avgHp > 0.7 && inCombat &&
+    // v7: no comfortable surges in survival wave 1 — the 30 s breather
+    // already satisfies the 600-tick gate, so wave 1 got +5 zombies at +1.6 s.
+    const surgeAllowed = this.mode === 'battle-royale' || this.wave > 1;
+    if (!nearWipe && avgHp > 0.7 && inCombat && surgeAllowed &&
         this.tickCount - this.director.lastSurgeTick > 600 &&
         this.zombies.size < 20 && Math.random() < 0.005) {
       this.triggerSurge('comfortable');
@@ -1119,6 +1153,12 @@ class Session {
     }
     const k = msg.keys || {};
     p.keys = { up: !!k.up, down: !!k.down, left: !!k.left, right: !!k.right };
+    // v7 analog stick: optional move magnitude 0..1 (touch stick deflection
+    // after dead-zone rescale; WASD/gamepad send 1). Absent = 1 (old clients).
+    if (msg.moveMag !== undefined) {
+      const m = Number(msg.moveMag);
+      p.moveMag = isFinite(m) ? clamp(m, 0, 1) : 1;
+    }
     if (msg.aim) {
       if (typeof msg.aim === 'number') p.aim = { x: Math.cos(msg.aim), y: Math.sin(msg.aim) };
       else if (msg.aim.x !== undefined) { const l = Math.hypot(msg.aim.x, msg.aim.y) || 1; p.aim = { x: msg.aim.x / l, y: msg.aim.y / l }; }
@@ -1691,7 +1731,14 @@ class Session {
         if (tgt) {
           if (td <= base.range) {
             // In range: wind up, then hit (line-of-sight checked — no through-wall).
-            if (z.state !== 'windup') { z.state = 'windup'; z.windupUntil = this.nowMs + base.windup * 1000; z.attackTarget = tgt; }
+            // v7 fairness: at most 3 zombies wind up on one player at once —
+            // the rest crowd around instead of deleting a full HP bar in one
+            // volley (measured 100 -> 0 in ~5 s with 13+ in range).
+            if (z.state !== 'windup') {
+              const windingUp = [...this.zombies.values()].filter(q => q !== z && q.state === 'windup' && q.attackTarget === tgt).length;
+              if (windingUp < 3) { z.state = 'windup'; z.windupUntil = this.nowMs + base.windup * 1000; z.attackTarget = tgt; }
+              else z.state = 'chase';
+            }
             else if (this.nowMs >= z.windupUntil) this.zombieAttack(z, tgt, base);
           } else {
             z.state = 'chase';
@@ -1730,15 +1777,31 @@ class Session {
       // Separation steering: push apart near neighbours only (skipped for
       // culled zombies — they are far apart by definition, and the push
       // can pin a zombie against a wall corner).
+      // CAP: the total shove per tick is at most half this zombie's own
+      // per-tick step. The old fixed 0.15 shove was 2.5x a shambler's
+      // 0.06 step, so a zombie queued single-file behind an engaged
+      // front rank was shoved back farther than it walked every tick —
+      // a permanent +0.06/-0.09 limit cycle (zombies visibly frozen a
+      // few tiles from the player, never arriving). The stuck detector
+      // could not see it: per-tick movement stayed above its 0.02
+      // threshold. The cap keeps separation (zombies still spread apart
+      // over ticks, and the front rank still gets shoved toward the
+      // player) while guaranteeing net forward progress for every type.
       if (!z.culled) {
+      const step = z.speed * TICK * stepMul;
+      const shoveCap = 0.5 * step;
+      let pushX = 0, pushY = 0;
       const cx = Math.floor(z.x), cy = Math.floor(z.y);
       for (let gx = cx - 1; gx <= cx + 1; gx++) for (let gy = cy - 1; gy <= cy + 1; gy++) {
         for (const o of grid.get(`${gx}:${gy}`) || []) {
           if (o === z) continue;
           const dx = z.x - o.x, dy = z.y - o.y, d = Math.hypot(dx, dy);
-          if (d > 0.01 && d < 0.6) { z.x += (dx / d) * 0.15; z.y += (dy / d) * 0.15; }
+          if (d > 0.01 && d < 0.6) { pushX += (dx / d) * 0.15; pushY += (dy / d) * 0.15; }
         }
       }
+      const pushLen = Math.hypot(pushX, pushY);
+      if (pushLen > shoveCap) { pushX = (pushX / pushLen) * shoveCap; pushY = (pushY / pushLen) * shoveCap; }
+      z.x += pushX; z.y += pushY;
       }
       z.x = clamp(z.x, arena.ZOMBIE_BOUNDS.minX, arena.ZOMBIE_BOUNDS.maxX);
       z.y = clamp(z.y, arena.ZOMBIE_BOUNDS.minY, arena.ZOMBIE_BOUNDS.maxY);
@@ -1757,7 +1820,26 @@ class Session {
           const tx = clamp(Math.floor(z.x), 0, 59), ty = clamp(Math.floor(z.y), 0, 59);
           const step = this.flowField ? this.flowField.dir[ty * 60 + tx] : null;
           const px = step ? -step.dy : 0, py = step ? step.dx : 1;
-          const n = arena.resolveCollision(z.x + px * 0.8, z.y + py * 0.8, 0.4);
+          // Nudge perpendicular to the flow — but pick the side whose
+          // flow-field distance is SMALLER (downhill). The old code
+          // always took the left side, which at a blocked corner shoves
+          // the zombie into the wall face: the flow field then walks it
+          // straight back to the same corner, so the unstuck event fired
+          // every ~40 ticks forever (measured: 31 fires, zombie pinned
+          // at the rock's NE corner (30, 21.6) for 2400 ticks). The
+          // downhill side is the way around the corner.
+          let nx = z.x + px * 0.8, ny = z.y + py * 0.8;
+          if (this.flowField) {
+            const distAt = (cx2, cy2) => {
+              if (cx2 < 0 || cy2 < 0 || cx2 >= 60 || cy2 >= 60) return Infinity;
+              const d = this.flowField.distGrid[cy2 * 60 + cx2];
+              return d === -1 ? Infinity : d;
+            };
+            const lx = clamp(Math.floor(z.x + px * 0.8), 0, 59), ly = clamp(Math.floor(z.y + py * 0.8), 0, 59);
+            const rx = clamp(Math.floor(z.x - px * 0.8), 0, 59), ry = clamp(Math.floor(z.y - py * 0.8), 0, 59);
+            if (distAt(rx, ry) < distAt(lx, ly)) { nx = z.x - px * 0.8; ny = z.y - py * 0.8; }
+          }
+          const n = arena.resolveCollision(nx, ny, 0.4);
           z.x = n.x; z.y = n.y;
           this.broadcast({ type: 'zombie-unstuck', zombieId: z.id });
         }
@@ -1864,11 +1946,13 @@ class Session {
     // Player movement: near-instant accel, stop within ~1 step (tight feel).
     for (const p of this.players.values()) {
       if (p.disconnected || p.state === 'dead' || p.state === 'extracted') continue;
-      const speed = p.state === 'downed' ? 1.2 : SPEED * this.speedMulFor(p); // downed crawls; role/buff speed applies when alive
+      const dodging = this.nowMs < p.dodgeUntil;
+      // v7: analog stick magnitude scales move speed; a dodge stays a full burst.
+      const mag = dodging ? 1 : (p.moveMag ?? 1);
+      const speed = (p.state === 'downed' ? 1.2 : SPEED * this.speedMulFor(p)) * mag; // downed crawls; role/buff speed applies when alive
       let dx = 0, dy = 0;
       if (p.keys.up) dy -= 1; if (p.keys.down) dy += 1;
       if (p.keys.left) dx -= 1; if (p.keys.right) dx += 1;
-      const dodging = this.nowMs < p.dodgeUntil;
       // Skydance dodge-dash: 1.8x dodge speed while the dash runs.
       const dodgeMul = dodging ? (DODGE_SPEED / SPEED) * (this.nowMs < p.skydanceUntil ? 1.8 : 1) : 1;
       const targetVx = dx !== 0 || dy !== 0

@@ -59,7 +59,7 @@ function unitTests() {
   const solo = new Session('SOLO');
   const sp = addFake(solo);
   check('solo session starts (breather, no full lobby needed)', solo.phase === 'breather');
-  tickN(solo, 600); // 30 s breather
+  tickN(solo, 900); // 45 s first breather (v7)
   check('solo session reaches wave 1', solo.phase === 'wave' && solo.wave === 1, `${solo.phase} wave ${solo.wave}`);
 
   console.log('\n--- unit: flow field ---');
@@ -258,9 +258,9 @@ function unitTests() {
     return r < sh;
   })());
   check('no through-wall attacks', (() => {
-    const s = new Session('WL'); const p = addFake(s); p.x = 11; p.y = 10; // behind house-nw (x8-14,y8-13)
-    const z = zombieNear(s, 'shambler', 11, 15);
-    // zombie on the other side of the house wall: LOS blocked
+    const s = new Session('WL'); const p = addFake(s); p.x = 5; p.y = 20; // north of the pond (x<=8, z>=21 blocked)
+    const z = zombieNear(s, 'shambler', 5, 25);
+    // zombie on the other side of the pond: LOS blocked
     const los = arena.hasLineOfSight(z.x, z.y, p.x, p.y);
     z.state = 'windup'; z.windupUntil = s.nowMs; z.attackTarget = p;
     s.zombieAttack(z, p, ZOMBIE_TYPES.shambler);
@@ -405,19 +405,19 @@ function unitTests() {
   })());
   check('arena geometry is VERIFIED (audit Job 1.3 merged, no longer assumed)',
     arena.VERIFIED_GEOMETRY === true && arena.ASSUMED_GEOMETRY === false);
-  check('arena bounds rect is the audited south-half Gate Town (x 0..30, y 14..30)',
-    arena.BOUNDS.minX === 0 && arena.BOUNDS.minY === 14 && arena.BOUNDS.maxX === 30 && arena.BOUNDS.maxY === 30);
-  check('arena blocked set is the audited 153 tiles (8 wall + 81 pond + 64 rock)',
-    arena.BLOCKED_COUNT === 153 && arena.tileBlocked(11, 10) && arena.tileBlocked(0, 21) && arena.tileBlocked(22, 22)
+  check('arena bounds rect is the FULL Gate Town (x 0..30, y 0..30 — expansion 2026-11-16)',
+    arena.BOUNDS.minX === 0 && arena.BOUNDS.minY === 0 && arena.BOUNDS.maxX === 30 && arena.BOUNDS.maxY === 30);
+  check('arena blocked set is the audited 145 tiles (81 pond + 64 rock; wall rows removed in the expansion)',
+    arena.BLOCKED_COUNT === 145 && !arena.tileBlocked(11, 10) && !arena.tileBlocked(11, 13) && arena.tileBlocked(0, 21) && arena.tileBlocked(22, 22)
     && !arena.tileBlocked(13, 13) && !arena.tileBlocked(14, 13) && !arena.tileBlocked(15, 19));
-  check('arena gates sit outside the playable bounds (west gate is the stated on-boundary exception)',
+  check('arena gates sit outside the playable bounds (west + main gates are the stated on-boundary exceptions)',
     arena.GATES.every(g => g.onBoundary || g.x < arena.BOUNDS.minX || g.x > arena.BOUNDS.maxX || g.y < arena.BOUNDS.minY || g.y > arena.BOUNDS.maxY));
   check('arena gates: main first (wave 1), west second (wave 2), 4 total (wave 3+)',
     arena.GATES.length === 4 && arena.GATES[0].id === 'gate-main' && arena.GATES[1].id === 'gate-west');
-  check('player spawns are spread apart (min 3 tiles — audited plaza layout, closest 3.16)', (() => {
+  check('player spawns are spread apart (min 5 tiles — full-town layout, closest 7.81)', (() => {
     const sp = arena.PLAYER_SPAWNS;
     for (let i = 0; i < sp.length; i++) for (let j = i + 1; j < sp.length; j++)
-      if (Math.hypot(sp[i].x - sp[j].x, sp[i].y - sp[j].y) < 3) return false;
+      if (Math.hypot(sp[i].x - sp[j].x, sp[i].y - sp[j].y) < 5) return false;
     return true;
   })());
   check('player spawns are all on walkable tiles and >= 6 tiles from every gate tile', (() => {
@@ -429,10 +429,37 @@ function unitTests() {
     }
     return true;
   })());
+  check('every gate tile reaches every player spawn, crate, and the extraction point (flow-field routing, no pockets)', (() => {
+    // BFS on the tile grid through walkable tiles only, from each gate tile.
+    function bfs(sx, sy) {
+      const seen = new Set([`${sx},${sy}`]); const q = [[sx, sy]];
+      while (q.length) {
+        const [x, y] = q.shift();
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= 60 || ny >= 60 || arena.tileBlocked(nx, ny) || seen.has(`${nx},${ny}`)) continue;
+          seen.add(`${nx},${ny}`); q.push([nx, ny]);
+        }
+      }
+      return seen;
+    }
+    const targets = [
+      ...arena.PLAYER_SPAWNS.map(s => [Math.floor(s.x), Math.floor(s.y)]),
+      ...arena.LOOT_CRATES.map(c => [Math.floor(c.x), Math.floor(c.y)]),
+      arena.EXTRACTION_POINT.tile,
+    ];
+    for (const g of arena.GATES) {
+      for (const t of (g.tiles || [{ x: g.x, y: g.y }])) {
+        const seen = bfs(Math.floor(t.x), Math.floor(t.y));
+        for (const [tx, ty] of targets) if (!seen.has(`${tx},${ty}`)) return false;
+      }
+    }
+    return true;
+  })());
   check('arena has barricade points, loot crates, extraction point',
     arena.BARRICADE_POINTS.length >= 4 && arena.LOOT_CRATES.length >= 4 && !!arena.EXTRACTION_POINT);
-  check('arena has exactly 10 loot crates and extraction at (15.5, 28.5) opening after wave 5',
-    arena.LOOT_CRATES.length === 10 && arena.EXTRACTION_POINT.x === 15.5 && arena.EXTRACTION_POINT.y === 28.5
+  check('arena has exactly 14 loot crates (10 south + 4 north) and extraction at (15.5, 28.5) opening after wave 5',
+    arena.LOOT_CRATES.length === 14 && arena.EXTRACTION_POINT.x === 15.5 && arena.EXTRACTION_POINT.y === 28.5
     && arena.EXTRACTION_POINT.opensAfterWave === 5);
 }
 
