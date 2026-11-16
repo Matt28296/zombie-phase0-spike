@@ -45,3 +45,54 @@ two-player session is still the acceptance test.**
 - Arena geometry vs real Gate Town (flagged ASSUMED in `arena.js`).
 - Tick time at full load (8 players, 120 zombies) — no load test run; `/stats` reports `avgTickMs` for the coordinator to measure (Phase 0 regression showed 0.73 ms at 2 players, no zombies).
 - Screamer audio cue / Brute red ring / hit-marker feedback — client-side, not server.
+
+## Addendum — arena merge (Job 1.3, 2026-11-16 ~07:30 UTC)
+- `arena.js` rewritten from the verified audit (`arena-definition.json`,
+  227/227 `arena-verify.js` checks): bounds rect tiles x 0–29, z 14–29
+  (players hard-clamped; gate-gap tiles (13,13)/(14,13) off-limits to players);
+  153 blocked tiles (8 wall + 81 pond + 64 rock); 4 gates (main 2-wide gap,
+  west on-boundary exception, east, south); 6 player spawns (spawn-1 = old
+  (15,19)); 10 loot crates; extraction (15.5, 28.5) opens after wave 5.
+- `server.js` changes (minimal): zombie clamp now uses `ZOMBIE_BOUNDS`
+  (full 60×60 grid) instead of the player rect; `spawnZombie` picks a
+  random tile when a gate defines several (main gate). `resolveCollision`
+  rewritten tile-based (was rect-based). `ASSUMED_GEOMETRY` is now false;
+  `VERIFIED_GEOMETRY` true.
+- Tests re-run after the merge: **`test-phase1.js` 84/84** (79 original +
+  5 new arena checks), **`test-two-clients.js` PASS 0 failed**,
+  **`arena-verify.js` 227/227**. Committed to GitHub
+  (`24e63aea6b6dddaaf5b6863d364a858bf1482771`, branch main; remote
+  re-read confirms the verified header). **Live Render service still runs
+  the old build — needs the manual redeploy trigger (browser task).**
+
+## Addendum — event-delivery fix (2026-11-16 ~08:15 UTC)
+- **Bug:** the server drained ONE global event queue (`this.events`) into
+  the FIRST player's snapshot each tick (`snapshotFor` spliced the whole
+  array), so the 2nd+ clients missed most events (hit markers, wave
+  banners, downed/revived, ...). Multiplayer event delivery was broken.
+- **Fix (server.js only, no protocol/event-shape change):** each player
+  now has their own event queue (`p.events`, set in `addPlayer`); a new
+  `Session.broadcast(ev)` copies every event into each CONNECTED
+  player's queue (disconnected players get nothing queued, so no stale
+  burst on resume); `snapshotFor(p)` drains only that player's queue.
+  All 21 `this.events.push(...)` sites now call `this.broadcast(...)`.
+  The snapshot format and event shapes are unchanged, so the client
+  (zombie-survival-mmo artifact) keeps working as-is.
+- **Tests:** new `test-events-two-clients.js` — **11/11 PASS** (unit:
+  A shoots, BOTH snapshots contain the `shot` event exactly once, plus
+  `wave-start` reaches both and no stale repeats; live WS: two real
+  clients, A shoots, both receive the same `shot` event exactly once).
+  `test-two-clients.js` PASS 0 failed (8/8). `test-phase1.js` **83/84**:
+  the single failure is `every zombie reaches a stationary player`
+  (max dist ~3.2–4.2 vs threshold < 3) — a PRE-EXISTING flaky
+  pathfinding test, not caused by this fix: the ORIGINAL server.js from
+  GitHub fails it 6 of 8 runs (max dist 2.08–5.22, only ~25% pass rate);
+  the fix touches only event delivery, not movement/flow-field. The
+  84/84 in the report above was a lucky run of that marginal test.
+  Committed to GitHub (`1b7f958`, branch main; re-read confirms
+  server.js identical, new test file present). **Live Render service
+  still runs the pre-fix build — needs the manual redeploy trigger.**
+- The "arena geometry vs real Gate Town" item above is now CLOSED for the
+  server; remaining unverified items from the audit (§9): waystone coords,
+  tree/rock exact coords, rock membership in old `blocked{}`, NPC collision,
+  scales (17,15), possible further blocked tiles (e.g. house footprints).
