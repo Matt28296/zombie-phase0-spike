@@ -1,1 +1,18 @@
-{"dependencies":{"ws":"^8.18.3"},"description":"Phase 0 network spike for the zombie multiplayer game — authoritative movement + snapshots only","engines":{"node":">=18"},"main":"server.js","name":"zombie-phase0-spike","scripts":{"start":"node server.js","test":"node test-two-clients.js"},"version":"0.1.0"}
+{
+  "dependencies": {
+    "https-proxy-agent": "^9.1.0",
+    "ws": "^8.18.3"
+  },
+  "description": "Phase 1 Survival-base server for the zombie multiplayer game \u2014 authoritative movement, lobbies, zombies, waves, weapons, downed/revive, extraction (extends the Phase 0 spike)",
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "server.js",
+  "name": "zombie-phase0-spike",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test-two-clients.js",
+    "test:phase1": "node test-phase1.js"
+  },
+  "version": "0.1.0"
+}
