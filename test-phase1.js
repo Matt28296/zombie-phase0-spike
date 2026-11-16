@@ -222,7 +222,7 @@ function unitTests() {
     const before = s.zombies.size;
     s.damageZombie(z, 9999, p);
     tickN(s, 60);
-    return screaming && s.zombies.size <= before - 1 && !s.events.some(e => e.type === 'surge');
+    return screaming && s.zombies.size <= before - 1 && !p.events.some(e => e.type === 'surge');
   })());
   check('screamer finishing its scream calls a surge', (() => {
     const s = new Session('SC2'); const p = addFake(s); p.x = 30; p.y = 30;

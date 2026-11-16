@@ -170,7 +170,6 @@ class Session {
     this.flowRecomputes = 0;
     this.flowLastTick = -999;
     this.director = { attention: 0, stress: 0, surges: 0, eased: false, lastSurgeTick: -9999 };
-    this.events = [];         // drained into snapshots
     this.score = { kills: 0, wavesReached: 0 };
     this.ended = false;
     this.endReason = null;
@@ -185,6 +184,20 @@ class Session {
   alivePlayers() { return [...this.players.values()].filter(p => p.state === 'alive'); }
   connectedPlayers() { return [...this.players.values()].filter(p => !p.disconnected); }
   playerCount() { return this.players.size; }
+
+  // Per-player event queues. The old global queue was drained into the
+  // FIRST player's snapshot each tick (snapshotFor spliced the whole
+  // array), so other clients missed most events. Now every broadcast
+  // event is copied into each CONNECTED player's own queue, and
+  // snapshotFor() drains only that player's queue. Disconnected players
+  // get nothing queued (they resume from the welcome + live state).
+  broadcast(ev) {
+    for (const p of this.players.values()) {
+      if (p.disconnected) continue;
+      if (!p.events) p.events = [];
+      p.events.push({ ...ev });
+    }
+  }
 
   addPlayer(ws) {
     if (this.ended) return { error: 'session ended' };
@@ -208,6 +221,7 @@ class Session {
       kills: 0, headshots: 0, revives: 0, damageDealt: 0, playersKilled: 0, timesDowned: 0,
       disconnected: false, disconnectAtMs: null, spectating: false,
       history: [], // {tick,x,y} ring, 1s window — lag compensation
+      events: [], // per-player event queue — drained into this player's snapshots only
       seq: 0, lastInputSeq: 0,
     };
     this.players.set(id, p);
@@ -226,7 +240,7 @@ class Session {
     if (!this.hibernating && this.nowMs - (p.disconnectAtMs || 0) > DISCONNECT_GRACE_MS) return { error: 'grace expired' };
     p.ws = ws; p.disconnected = false; p.disconnectAtMs = null;
     if (this.hibernating) { this.hibernating = false; this.hibernateAtMs = null; }
-    this.events.push({ type: 'reconnected', playerId: id });
+    this.broadcast({ type: 'reconnected', playerId: id });
     return { player: p };
   }
 
@@ -234,7 +248,7 @@ class Session {
     this.phase = 'breather';
     this.wave = 0;
     this.breatherEndsAt = this.nowMs + BREATHER_SECONDS * 1000;
-    this.events.push({ type: 'session-start', code: this.code });
+    this.broadcast({ type: 'session-start', code: this.code });
   }
 
   startWave(n) {
@@ -260,7 +274,7 @@ class Session {
       [this.spawnList[i], this.spawnList[j]] = [this.spawnList[j], this.spawnList[i]];
     }
     this.activeGates = arena.GATES.slice(0, def.gates);
-    this.events.push({ type: 'wave-start', wave: n, count: total });
+    this.broadcast({ type: 'wave-start', wave: n, count: total });
   }
 
   spawnZombie(type, gate) {
@@ -337,7 +351,7 @@ class Session {
         const nearest = Math.min(...alive.filter(q => q !== p).map(q => dist(p.x, p.y, q.x, q.y)), Infinity);
         if (alive.length > 1 && nearest > 10 && Math.random() < 0.5) {
           this.spawnZombie('runner');
-          this.events.push({ type: 'isolated-pressure', playerId: p.id });
+          this.broadcast({ type: 'isolated-pressure', playerId: p.id });
         }
       }
     }
@@ -347,7 +361,7 @@ class Session {
     this.director.lastSurgeTick = this.tickCount;
     const n = 4 + this.wave;
     for (let i = 0; i < n; i++) this.spawnZombie(Math.random() < 0.7 ? 'shambler' : 'runner');
-    this.events.push({ type: 'surge', reason, count: n });
+    this.broadcast({ type: 'surge', reason, count: n });
   }
 
   // ---- Player input (minimal protocol) ----
@@ -415,7 +429,7 @@ class Session {
     if (shooter.state !== 'alive' || shooter.reloadingWeapon) return null;
     if (this.nowMs - shooter.lastShotMs < w.fireMs) return null;
     if (w.ammoType && shooter.mag[shooter.currentWeapon] <= 0) {
-      this.events.push({ type: 'empty-click', playerId: shooter.id });
+      this.broadcast({ type: 'empty-click', playerId: shooter.id });
       shooter.lastShotMs = this.nowMs; // avoid click spam
       return { empty: true };
     }
@@ -455,7 +469,7 @@ class Session {
       if (p.state === 'alive' && this.nowMs < p.graceEndsAt) continue; // grace: no PvP damage (downed players CAN be executed)
       consider(p, 'player', posAt(p));
     }
-    if (!bestHit) { this.events.push({ type: 'shot', playerId: shooter.id, weapon: shooter.currentWeapon, hit: false }); return { hit: false }; }
+    if (!bestHit) { this.broadcast({ type: 'shot', playerId: shooter.id, weapon: shooter.currentWeapon, hit: false }); return { hit: false }; }
     // Head vs body: explicit hitZone from client (aim height) or shotgun pellets.
     // Head pays +100% with a distinct marker. Server validates range/angle
     // above, so a client cannot fake a headshot on an out-of-range target.
@@ -476,7 +490,7 @@ class Session {
     const hit = { hit: true, kind: bestHit.kind, id: bestHit.ent.id, damage: dmg, head: isHead, dist: bestHit.dist };
     if (bestHit.kind === 'zombie') this.damageZombie(bestHit.ent, dmg, shooter);
     else this.damagePlayer(bestHit.ent, dmg, shooter);
-    this.events.push({ type: 'shot', playerId: shooter.id, weapon: shooter.currentWeapon, hit: true, head: isHead, targetId: bestHit.ent.id, targetKind: bestHit.kind, damage: dmg });
+    this.broadcast({ type: 'shot', playerId: shooter.id, weapon: shooter.currentWeapon, hit: true, head: isHead, targetId: bestHit.ent.id, targetKind: bestHit.kind, damage: dmg });
     return hit;
   }
 
@@ -488,7 +502,7 @@ class Session {
       if (shooter) { shooter.kills++; if (shooter.currentWeapon === 'melee') { /* silent: no noise */ } }
       // Elite drops better loot.
       if (z.elite) this.lootPiles.push({ id: `l${nextLootId++}`, x: z.x, y: z.y, items: { meds: 1, ammo: { rifle: 12, shells: 6 } } });
-      this.events.push({ type: 'zombie-killed', zombieId: z.id, by: shooter ? shooter.id : null, elite: z.elite || null });
+      this.broadcast({ type: 'zombie-killed', zombieId: z.id, by: shooter ? shooter.id : null, elite: z.elite || null });
       this.drainQueue();
     }
   }
@@ -507,7 +521,7 @@ class Session {
   downPlayer(p, attacker) {
     p.hp = 0; p.state = 'downed'; p.downedTimerMs = DOWNED_SECONDS * 1000;
     p.timesDowned++; p.reloadingWeapon = null;
-    this.events.push({ type: 'player-downed', playerId: p.id, by: attacker ? attacker.id : null });
+    this.broadcast({ type: 'player-downed', playerId: p.id, by: attacker ? attacker.id : null });
   }
 
   killPlayer(p, killer, cause) {
@@ -516,7 +530,7 @@ class Session {
     // Loot drop: carried loot drops in a lootable pile; equipped weapons STAY.
     this.lootPiles.push({ id: `l${nextLootId++}`, x: p.x, y: p.y, items: { ammo: { ...p.ammo }, meds: p.carried.meds, materials: p.carried.materials } });
     p.carried = { meds: 0, materials: 0 };
-    this.events.push({ type: 'player-died', playerId: p.id, by: killer ? killer.id : null, cause });
+    this.broadcast({ type: 'player-died', playerId: p.id, by: killer ? killer.id : null, cause });
     this.checkWipe();
   }
 
@@ -532,7 +546,7 @@ class Session {
       waveReached: this.wave, kills: this.score.kills,
       players: [...this.players.values()].map(p => ({ id: p.id, kills: p.kills, headshots: p.headshots, revives: p.revives, playersKilled: p.playersKilled, damageDealt: p.damageDealt, timesDowned: p.timesDowned, state: p.state })),
     };
-    this.events.push({ type: 'session-end', reason, score: this.endScore });
+    this.broadcast({ type: 'session-end', reason, score: this.endScore });
   }
 
   // Revive: 3s held channel, interruptible (move/damage/dodge breaks it).
@@ -546,7 +560,7 @@ class Session {
       if (p.reviveProgressMs >= REVIVE_SECONDS * 1000) {
         target.state = 'alive'; target.hp = Math.round(target.maxHp * 0.5);
         target.downedTimerMs = 0; p.revives++; p.reviveTarget = null; p.reviveProgressMs = 0;
-        this.events.push({ type: 'player-revived', playerId: target.id, by: p.id });
+        this.broadcast({ type: 'player-revived', playerId: target.id, by: p.id });
       }
     }
     // Downed timers: unattended downed players are finished by zombies / timer.
@@ -565,7 +579,7 @@ class Session {
         if (!c.looted && dist(p.x, p.y, c.x, c.y) < 2) {
           c.looted = true;
           p.ammo.pistol += 24; p.ammo.smg += 30; p.carried.meds += 1;
-          this.events.push({ type: 'crate-looted', playerId: p.id, crateId: c.id });
+          this.broadcast({ type: 'crate-looted', playerId: p.id, crateId: c.id });
         }
       }
       for (const pile of this.lootPiles) {
@@ -573,7 +587,7 @@ class Session {
           pile.taken = true;
           if (pile.items.ammo) for (const [k, v] of Object.entries(pile.items.ammo)) p.ammo[k] = (p.ammo[k] || 0) + v;
           if (pile.items.meds) p.carried.meds += pile.items.meds;
-          this.events.push({ type: 'loot-taken', playerId: p.id, lootId: pile.id });
+          this.broadcast({ type: 'loot-taken', playerId: p.id, lootId: pile.id });
         }
       }
     }
@@ -610,7 +624,7 @@ class Session {
       // Screamer: scream on sighting (range 15), 2s channel -> surge unless killed.
       if (base.screams && !z.screamed && nearestD < 15) {
         z.screamed = true; z.screamUntil = this.nowMs + 2000; z.state = 'screaming';
-        this.events.push({ type: 'screamer-scream', zombieId: z.id });
+        this.broadcast({ type: 'screamer-scream', zombieId: z.id });
       }
       if (z.state === 'screaming') {
         if (this.nowMs >= z.screamUntil) { z.state = 'chase'; this.triggerSurge('screamer'); }
@@ -649,7 +663,7 @@ class Session {
         z.state = 'chase';
         this.acidPools = this.acidPools || [];
         this.acidPools.push({ x: z.attackTarget.x, y: z.attackTarget.y, until: this.nowMs + 3000 });
-        this.events.push({ type: 'acid-pool', x: z.attackTarget.x, y: z.attackTarget.y });
+        this.broadcast({ type: 'acid-pool', x: z.attackTarget.x, y: z.attackTarget.y });
         z.attackTarget = null;
       }
       // Separation steering: push apart near neighbours only (skipped for
@@ -684,7 +698,7 @@ class Session {
           const px = step ? -step.dy : 0, py = step ? step.dx : 1;
           const n = arena.resolveCollision(z.x + px * 0.8, z.y + py * 0.8, 0.4);
           z.x = n.x; z.y = n.y;
-          this.events.push({ type: 'zombie-unstuck', zombieId: z.id });
+          this.broadcast({ type: 'zombie-unstuck', zombieId: z.id });
         }
       }
       z.prevX = z.x; z.prevY = z.y;
@@ -810,7 +824,7 @@ class Session {
         p.extractingMs += TICK_MS;
         if (p.extractingMs >= EXTRACTION_SECONDS * 1000) {
           p.state = 'extracted';
-          this.events.push({ type: 'player-extracted', playerId: p.id });
+          this.broadcast({ type: 'player-extracted', playerId: p.id });
           if (!this.alivePlayers().length && ![...this.players.values()].some(q => q.state === 'downed')) this.endSession('extraction');
         }
       } else p.extractingMs = Math.max(0, p.extractingMs - TICK_MS);
@@ -835,11 +849,11 @@ class Session {
       if (this.waveRemainingToSpawn <= 0 && this.spawnQueue.length === 0 && this.zombies.size === 0) {
         if (this.wave >= EXTRACTION_WAVE && !this.extractionOpen) {
           this.extractionOpen = true;
-          this.events.push({ type: 'extraction-open', point: arena.EXTRACTION_POINT });
+          this.broadcast({ type: 'extraction-open', point: arena.EXTRACTION_POINT });
         }
         this.phase = 'breather';
         this.breatherEndsAt = this.nowMs + BREATHER_SECONDS * 1000;
-        this.events.push({ type: 'wave-cleared', wave: this.wave });
+        this.broadcast({ type: 'wave-cleared', wave: this.wave });
       }
     }
     this.zombieTick();
@@ -869,7 +883,7 @@ class Session {
       });
       z.lastHitTick = this.tickCount;
     }
-    const events = this.events.splice(0, this.events.length);
+    const events = p.events ? p.events.splice(0, p.events.length) : [];
     return {
       type: 'snapshot', tick: this.tickCount, code: this.code,
       players, zombies,
