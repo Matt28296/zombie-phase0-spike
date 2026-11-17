@@ -25,10 +25,16 @@
 // Pond (81) and rock corner (64) STAY blocked: visible terrain, water
 // blocked per the old isBlocked rule, rock per the audit's direction.
 // arena-verify.js still encodes the OLD south-half geometry (bounds,
-// 153 blocked, wall rows) and needs a re-audit for the new geometry;
-// the new geometry is instead covered by test-phase1.js (bounds,
-// blocked count, gate/spawn separation, BFS connectivity from every
-// gate to every spawn/crate/extraction) and the reach test.
+// 153 blocked, wall rows). The re-audit for the new geometry is
+// hidden_files/arena-verify-expanded.js (r10d, 2026-11-17): 367 checks,
+// 367 passed — boundary walk, blocked-set composition, BLOCKED_GRID
+// consistency, spawn/gate distances, barricade reachability +
+// route-blocking, extraction, placement consistency, BR drop LOS
+// neighbours, zone geometry across phase transitions, resolveCollision
+// sanity, and live Session spot checks. The new geometry is also covered
+// by test-phase1.js (bounds, blocked count, gate/spawn separation, BFS
+// connectivity from every gate to every spawn/crate/extraction) and the
+// reach test.
 // ---------------------------------------------------------------------------
 'use strict';
 
@@ -194,11 +200,57 @@ function resolveCollision(x, y, r) {
           const d = Math.sqrt(d2);
           x = cx + (dx / d) * r; y = cy + (dy / d) * r;
         } else {
+          // Point is inside the tile (on an edge/corner or deep inside).
+          // Push out along the closest edge whose NEIGHBOURING tile is
+          // walkable AND whose push destination stays inside the player
+          // bounds. The old closest-edge rule could push INTO the
+          // blocked region: a Scout Skydance dash penetrating >0.5 tiles
+          // flipped the push direction, and the player was walked through
+          // the pond and out of bounds (r10d: dash west into the pond
+          // east edge ended at x=-0.40). A neighbour outside the grid
+          // counts as blocked, so this can never push a player out of
+          // bounds either — including off the south/east edges, where
+          // the grid extends to 60 but the player rect ends at 30.
+          // If every neighbour is blocked (deep interior of a solid
+          // region — unreachable in play, spawns are walkable and
+          // movement pushes out on entry), fall back to the closest
+          // edge that stays in bounds. Tie-break keeps the old priority
+          // (south, north, west, east): a zombie walking east along a
+          // south edge is pushed south (clear of the wall) instead of
+          // back west forever.
           const pl = x - tx, pr = tx + 1 - x, pt = y - ty, pb = ty + 1 - y;
-          const m = Math.min(pl, pr, pt, pb);
-          if (m === pb) y = ty + 1 + r;
-          else if (m === pt) y = ty - r;
-          else if (m === pl) x = tx - r;
+          const inBounds = (d) => d === 's' ? ty + 1 + r <= BOUNDS.maxY
+            : d === 'n' ? ty - r >= BOUNDS.minY
+            : d === 'w' ? tx - r >= BOUNDS.minX
+            : tx + 1 + r <= BOUNDS.maxX;
+          const cands = [];
+          if (!tileBlocked(tx, ty + 1) && inBounds('s')) cands.push([pb, 's']);
+          if (!tileBlocked(tx, ty - 1) && inBounds('n')) cands.push([pt, 'n']);
+          if (!tileBlocked(tx - 1, ty) && inBounds('w')) cands.push([pl, 'w']);
+          if (!tileBlocked(tx + 1, ty) && inBounds('e')) cands.push([pr, 'e']);
+          let dir;
+          if (cands.length) {
+            let best = Infinity;
+            for (const [v, d] of cands) if (v < best) { best = v; dir = d; }
+          } else {
+            // No walkable in-bounds exit: closest edge that stays in
+            // bounds (deep interior; unreachable in play).
+            const fb = [];
+            if (inBounds('s')) fb.push([pb, 's']);
+            if (inBounds('n')) fb.push([pt, 'n']);
+            if (inBounds('w')) fb.push([pl, 'w']);
+            if (inBounds('e')) fb.push([pr, 'e']);
+            if (fb.length) {
+              let best = Infinity;
+              for (const [v, d] of fb) if (v < best) { best = v; dir = d; }
+            } else {
+              const m = Math.min(pl, pr, pt, pb);
+              dir = m === pb ? 's' : m === pt ? 'n' : m === pl ? 'w' : 'e';
+            }
+          }
+          if (dir === 's') y = ty + 1 + r;
+          else if (dir === 'n') y = ty - r;
+          else if (dir === 'w') x = tx - r;
           else x = tx + 1 + r;
         }
         pushed = true;
@@ -234,5 +286,5 @@ module.exports = {
   tileBlocked, resolveCollision, hasLineOfSight,
   ASSUMED_GEOMETRY: false,
   VERIFIED_GEOMETRY: true,
-  VERIFIED_NOTE: 'Geometry verified 2026-11-16 by the arena audit (Job 1.3) against the live Gate Town region; see arena-definition.json + arena-audit.md. 227/227 arena-verify.js checks pass against the ORIGINAL south-half geometry. 2026-11-16 expansion to the full town (bounds y 0..30, wall rows removed, gates/spawns/crates extended north) is a design change on audit-surveyed terrain, validated by test-phase1.js connectivity + reach tests; arena-verify.js needs a re-audit for the new geometry.',
+  VERIFIED_NOTE: 'Geometry verified 2026-11-16 by the arena audit (Job 1.3) against the live Gate Town region; see arena-definition.json + arena-audit.md. 227/227 arena-verify.js checks pass against the ORIGINAL south-half geometry. 2026-11-16 expansion to the full town (bounds y 0..30, wall rows removed, gates/spawns/crates extended north) is a design change on audit-surveyed terrain, re-audited 2026-11-17 by hidden_files/arena-verify-expanded.js (r10d): 367/367 checks pass against the live expanded geometry, including BR drop points, zone transitions, and live Session movement/collision checks.',
 };

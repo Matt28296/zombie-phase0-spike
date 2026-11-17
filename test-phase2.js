@@ -645,15 +645,15 @@ function unitTests() {
   })());
 
   console.log('\n--- unit: weapon-grant path ---');
-  check('crate can grant a weapon the player does not own (shotgun)', (() => {
+  check('crate can grant a weapon the player does not own (rifle — shotgun is now the breather-0 second weapon)', (() => {
     const s = new Session('WG-CRATE'); const p = addFake(s);
     const crate = s.crates[0];
     p.x = crate.x; p.y = crate.y; p.interactHeld = true;
     const realRandom = Math.random;
-    Math.random = () => 0.1; // < 0.35 -> weapon branch, missing[0] = shotgun
+    Math.random = () => 0.1; // < 0.35 -> weapon branch, missing[0] = rifle (shotgun already owned from breather 0)
     try { tickN(s, 1); } finally { Math.random = realRandom; }
     const ev = findEvent(p, 'crate-looted');
-    return p.weapons.includes('shotgun') && !!ev && ev.granted === 'shotgun';
+    return p.weapons.includes('rifle') && !!ev && ev.granted === 'rifle';
   })());
   check('crate can grant an attachment for an owned gun', (() => {
     const s = new Session('WG-ATT'); const p = addFake(s);

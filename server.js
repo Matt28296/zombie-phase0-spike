@@ -56,6 +56,8 @@ const FLOW_RECOMPUTE_EVERY = 10;  // ticks -> 2 Hz, never per-zombie A*
 const HISTORY_TICKS = 20;         // 1 s position-history ring (lag comp)
 const GRACE_SECONDS = 10;         // spawn grace: no PvP damage, zombies can hurt
 const DOWNED_SECONDS = 60;
+const DOWNED_EXECUTE_GRACE_MS = 12000; // tuning round 2026-11-17: zombies may not execute a downed player for 12 s after the down. Derived from r9c timings: 3 s drive (15 u at 5 u/s, a nearby teammate) + 6 s revive hold (harness-measured, r9c) + 3 s margin (snapshot lag + brief clear) = 12 s. Bleed-out stays 60 s, so a downed player with no teammate nearby still dies — downed is still dangerous, just no longer instantly fatal. PvP executes are NOT gated (deliberate player action, trust -30).
+const WAVE1_EXTRA_CAP = 3; // tuning round 2026-11-17: director extras (noise surges, isolated pressure) in Survival wave 1 are capped at 3, so total wave-1 spawns stay ≤ nominal + 3 (14 for 2 players, 11 solo). r9c measured 21–39 zombies vs 11 nominal when two players shoot.
 const REVIVE_SECONDS = 3;
 const DISCONNECT_GRACE_MS = 30 * 1000;
 const HIBERNATE_MS = 5 * 60 * 1000;
@@ -178,6 +180,17 @@ function waveCount(n, playersAlive) {
 // still has 8 x 30 HP shamblers to kill. Waves 2+ use full stats.
 const WAVE1_GROGGY = { speedMul: 0.85, damageMul: 0.5, windupMul: 2.5, maxWindup: 2, spawnIntervalMs: 1500 };
 
+// BR opening groggy profile: same speed/damage as Survival wave 1, but an
+// even longer windup and only ONE concurrent attacker — the sustained DPS
+// is what kills a fresh drop, and wave-1 values still left a passive player
+// downed at ~39.5 s (t4 re-run 2, 2026-11-16: ~2 attackers x 4 dmg / 1.5 s
+// = ~5.3 dmg/s once the horde converges). One attacker x 4 dmg / 2.1 s =
+// ~1.9 dmg/s: a passive player survives the opening, a fighting player
+// kills the attacker in 2 melee hits and loots freely. Zone phase 1+ uses
+// full stats (cap 3, 0.6 s windup). Target: passive solo player not downed
+// within 60 s, first damage >= 20 s.
+const BR_OPENING_GROGGY = { speedMul: 0.85, damageMul: 0.5, windupMul: 3.5, maxWindup: 1, spawnIntervalMs: 1500 };
+
 // ---- Battle Royale (Phase 3, spec §2.7; map scope: FULL Gate Town —
 // x 0..30, y 0..30, expanded 2026-11-16. Full 60x60-map BR is a
 // Phase 4 job.) ----
@@ -218,12 +231,16 @@ function computeNextZone(current, nextRadius) {
   const maxShift = Math.max(0, (current.r - nextRadius) * 0.7);
   for (let attempt = 0; attempt < 12; attempt++) {
     const ang = Math.random() * Math.PI * 2;
-    // 1.6 nominal so the 2-decimal rounding below can never push the
-    // observed shift under the 1.5-tile guarantee.
+    // 1.6 nominal gives margin above the 1.5 guarantee, so clamping
+    // usually leaves a passing shift and the loop rarely retries.
     const d = 1.6 + Math.random() * Math.max(0, maxShift - 1.6);
-    const cx = clamp(current.x + Math.cos(ang) * d, minX, maxX);
-    const cy = clamp(current.y + Math.sin(ang) * d, minY, maxY);
-    if (dist(cx, cy, current.x, current.y) >= 1.5) return { x: +cx.toFixed(2), y: +cy.toFixed(2), r: nextRadius };
+    // Round FIRST, then check the shift on the rounded centre: clamping
+    // can shave a 1.6 shift to just above 1.5, and the 2-decimal rounding
+    // shaves up to ~0.007 more — checking the pre-rounding value let
+    // shifts of 1.4966–1.4986 slip through (r10c flake, ~0.4%/run).
+    const cx = +clamp(current.x + Math.cos(ang) * d, minX, maxX).toFixed(2);
+    const cy = +clamp(current.y + Math.sin(ang) * d, minY, maxY).toFixed(2);
+    if (dist(cx, cy, current.x, current.y) >= 1.5) return { x: cx, y: cy, r: nextRadius };
   }
   // Deterministic fallback: shift 2 tiles in a direction that stays in bounds.
   let cx = current.x, cy = current.y;
@@ -379,6 +396,8 @@ class Session {
     this.breatherEndsAt = 0;
     this.waveRemainingToSpawn = 0;
     this.waveSpawned = 0;
+    this.waveExtras = 0; // director extras spawned in the current Survival wave (capped, see spawnDirectorExtra)
+    this.waveExtraCap = Infinity; // set per wave by startWave; Infinity = uncapped (BR, lobby, manual setups)
     this.spawnTimerMs = 0;
     this.extractionOpen = false;
     this.flowField = null;
@@ -529,6 +548,24 @@ class Session {
     }
     p.ammo[WEAPONS[w].ammoType] = (p.ammo[WEAPONS[w].ammoType] || 0) + WEAPONS[w].reserveStart;
     return true;
+  }
+
+  // Tuning round 2026-11-17: guaranteed second weapon in breather 0.
+  // r9b/r9c: ammo/loot luck decided loadouts — a player could reach wave 3
+  // pistol-only with no ammo left. Every Survival player now leaves
+  // breather 0 with a second gun: shotgun, the short-range complement to
+  // the role primary (rank order is rifle > pistol > shotgun > smg, so the
+  // grant never outranks the primary); a player who already owns the
+  // shotgun gets the pistol instead. Safe to call twice / after looting —
+  // it is a no-op once the player owns the granted gun. Mag + reserve come
+  // from grantWeapon (full mag + reserveStart on top of the spawn reserves).
+  // BR is untouched: melee-only drop-in (§2.7).
+  grantBreatherWeapon(p) {
+    if (this.mode !== 'survival') return;
+    const second = p.weapons.includes('shotgun') ? 'pistol' : 'shotgun';
+    if (p.weapons.includes(second)) return;
+    this.grantWeapon(p, second);
+    this.broadcast({ type: 'second-weapon', playerId: p.id, weapon: second });
   }
   // Loot multiplier: Leader aura (+5% loot, rounded up) + ammo perk (+25%).
   lootMult(p) {
@@ -814,7 +851,7 @@ class Session {
       id, ws, color: COLORS[(num - 1) % COLORS.length],
       x: spawn.x, y: spawn.y, vx: 0, vy: 0,
       hp: 100, maxHp: 100, state: 'alive', // alive | downed | dead | extracted
-      downedTimerMs: 0, graceEndsAt: this.nowMs + GRACE_SECONDS * 1000,
+      downedTimerMs: 0, downedAtMs: 0, graceEndsAt: this.nowMs + GRACE_SECONDS * 1000,
       // BR: melee only, no gun, no ammo — every gun is looted (§2.7).
       weapons: isBR ? ['melee'] : ['pistol', 'melee'],
       currentWeapon: isBR ? 'melee' : 'pistol',
@@ -847,6 +884,10 @@ class Session {
     this.players.set(id, p);
     this.peakPlayers = Math.max(this.peakPlayers, this.players.size);
     if (this.phase === 'lobby') this.startSession();
+    // Late joiner during breather 0 still gets the second weapon
+    // (tuning round 2026-11-17); startSession already granted it to
+    // everyone present, so this only fires for later joiners.
+    if (this.phase === 'breather' && this.wave === 0) this.grantBreatherWeapon(p);
     return { player: p };
   }
 
@@ -878,12 +919,18 @@ class Session {
     this.phase = 'breather';
     this.wave = 0;
     this.breatherEndsAt = this.nowMs + FIRST_BREATHER_SECONDS * 1000;
+    // Breather-0 second weapon (tuning round 2026-11-17): everyone present
+    // gets their second gun now; later joiners get it in addPlayer.
+    for (const p of this.players.values()) this.grantBreatherWeapon(p);
     this.broadcast({ type: 'session-start', code: this.code });
   }
 
   // ---- Battle Royale: zone, zone-paced director, win detection ----
   initZone() {
     this.brStartedAt = this.nowMs;
+    // First BR spawn lands ~12 s in, not 6 — the drop-in gets a moment to
+    // land and look around before the horde starts walking in.
+    this.spawnTimerMs = -6000;
     this.zone = {
       phase: 0,
       current: { x: BR_ZONE_CENTRE.x, y: BR_ZONE_CENTRE.y, r: BR_ZONE_SCHEDULE[0].radius },
@@ -952,7 +999,9 @@ class Session {
     const def = BR_DIRECTOR[this.zone.phase];
     // v7: phase 0 is loot time — the director spawns 1/4 s for the first
     // 30 s (a melee-only player took first damage at ~8 s at 1/2.5 s).
-    const intervalMs = (this.zone.phase === 0 && this.nowMs - this.brStartedAt < 30000) ? 4000 : def.intervalMs;
+    // BR-opening retune: 1/6 s for the first 30 s — fewer zombies converging
+    // on the fresh drop while the groggy horde is still walking in.
+    const intervalMs = (this.zone.phase === 0 && this.nowMs - this.brStartedAt < 30000) ? 6000 : def.intervalMs;
     this.spawnTimerMs += TICK_MS;
     if (this.spawnTimerMs >= intervalMs) {
       this.spawnTimerMs = 0;
@@ -970,9 +1019,13 @@ class Session {
   // spot, return null and skip this spawn tick.
   zoneSpawnPoint() {
     const z = this.zone.current;
+    // BR opening: pass 0 keeps spawns >= 10 tiles from any living player
+    // (was 6 — a 7-tile spawn walked in in ~7 s and dealt first damage at
+    // ~16 s; 10 tiles at groggy speed buys the >= 20 s first-damage bar).
+    const pass0MinD = this.zone.phase === 0 ? 10 : 6;
     for (let pass = 0; pass < 2; pass++) {
       const tries = pass === 0 ? 30 : 10;
-      const minD = pass === 0 ? 6 : (z.r >= 6 ? 3 : 0);
+      const minD = pass === 0 ? pass0MinD : (z.r >= 6 ? 3 : 0);
       for (let i = 0; i < tries; i++) {
         const ang = Math.random() * Math.PI * 2;
         const rr = z.r * (0.7 + Math.random() * 0.25);
@@ -1044,6 +1097,12 @@ class Session {
     const def = waveDef(n);
     this.waveRemainingToSpawn = total;
     this.waveSpawned = 0;
+    // r10f: director extras for this wave are capped at the nominal wave
+    // count (wave 1 keeps its tighter cap of 3). The cap is per-wave and
+    // counts every extra through spawnDirectorExtra; the wave's own spawn
+    // list is never capped. W3 duo total <= 35 + 35 = 70, W4 <= 43 + 43 = 86.
+    this.waveExtras = 0;
+    this.waveExtraCap = (n === 1 ? WAVE1_EXTRA_CAP : total);
     this.spawnTimerMs = 0;
     // Build spawn list from mix, shuffled.
     this.spawnList = [];
@@ -1061,6 +1120,14 @@ class Session {
     this.broadcast({ type: 'wave-start', wave: n, count: total });
   }
 
+  // Groggy opening profile: Survival wave 1 OR BR zone phase 0. One
+  // definition, used both where stats are baked at spawn and where windup /
+  // attacker cap are computed per tick, so the two can never drift apart.
+  groggyNow() {
+    if (this.mode === 'survival') return this.wave === 1;
+    if (this.mode === 'battle-royale') return !!this.zone && this.zone.phase === 0;
+    return false;
+  }
   spawnZombie(type, gate, pos) {
     if (this.zombies.size >= ZOMBIE_CAP) { this.spawnQueue.push({ type, gate }); return false; }
     const base = ZOMBIE_TYPES[type];
@@ -1093,15 +1160,17 @@ class Session {
       gx = t.x; gy = t.y;
     }
     // Minimum spawn distance from any player (fairness, §5.1).
-    // Wave-1 groggy profile (see WAVE1_GROGGY): freshly risen zombies
-    // are slower and weaker. Applies to every zombie spawned while the
-    // session is in Survival wave 1 (director spawns included); the
-    // stats are baked in at spawn, so wave-2 zombies are full strength.
-    const groggy = this.mode === 'survival' && this.wave === 1;
+    // Groggy opening profile (see WAVE1_GROGGY / BR_OPENING_GROGGY):
+    // freshly risen zombies are slower and weaker. Applies to every zombie
+    // spawned while the session is in Survival wave 1 or BR zone phase 0
+    // (director spawns included); the stats are baked in at spawn, so
+    // wave-2 / phase-1+ zombies are full strength.
+    const groggy = this.groggyNow();
+    const prof = this.mode === 'battle-royale' ? BR_OPENING_GROGGY : WAVE1_GROGGY;
     const z = {
       id, type, elite, x: gx, y: gy, hp, maxHp: hp,
-      speed: base.speed * (affix ? affix.speedMul : 1) * (groggy ? WAVE1_GROGGY.speedMul : 1),
-      damage: base.damage * (affix && affix.dmgMul ? affix.dmgMul : 1) * (groggy ? WAVE1_GROGGY.damageMul : 1),
+      speed: base.speed * (affix ? affix.speedMul : 1) * (groggy ? prof.speedMul : 1),
+      damage: base.damage * (affix && affix.dmgMul ? affix.dmgMul : 1) * (groggy ? prof.damageMul : 1),
       state: 'chase', windupUntil: 0, attackTarget: null, screamUntil: 0, screamed: false,
       spitCdUntil: 0, zigPhase: Math.random() * Math.PI * 2, lastHitTick: -1,
       history: [], cullTick: 0, version: 0, look: Math.floor(Math.random() * 10),
@@ -1140,7 +1209,11 @@ class Session {
     const inCombat = this.phase === 'wave' || this.mode === 'battle-royale';
     // v7: no comfortable surges in survival wave 1 — the 30 s breather
     // already satisfies the 600-tick gate, so wave 1 got +5 zombies at +1.6 s.
-    const surgeAllowed = this.mode === 'battle-royale' || this.wave > 1;
+    // Same bug in BR: the gate is satisfied from session start (inCombat is
+    // true in BR from tick 1), so a fresh drop got +4 zombies at ~9 s
+    // (t4 re-run 2026-11-16: 10 zombies by 24 s, 4 from the surge).
+    // Comfortable surges stay blocked through BR zone phase 0 (loot time).
+    const surgeAllowed = this.mode === 'battle-royale' ? (this.zone && this.zone.phase > 0) : this.wave > 1;
     if (!nearWipe && avgHp > 0.7 && inCombat && surgeAllowed &&
         this.tickCount - this.director.lastSurgeTick > 600 &&
         this.zombies.size < 20 && Math.random() < 0.005) {
@@ -1160,7 +1233,7 @@ class Session {
     if (this.director.attention >= 50 && this.zombies.size < 40) {
       this.director.attention = 0;
       this.triggerSurge('noise');
-      for (let i = 0; i < 2; i++) this.spawnZombie('runner');
+      for (let i = 0; i < 2; i++) this.spawnDirectorExtra('runner');
     }
     // Isolated-player pressure: lone looter (>10 tiles from nearest ally)
     // draws Runners. Simple check once per second. Scouts are ignored
@@ -1170,18 +1243,33 @@ class Session {
         if (p.role === 'scout' && alive.some(q => q !== p && q.role !== 'scout')) continue;
         const nearest = Math.min(...alive.filter(q => q !== p).map(q => dist(p.x, p.y, q.x, q.y)), Infinity);
         if (alive.length > 1 && nearest > 10 && Math.random() < 0.5) {
-          this.spawnZombie('runner');
+          this.spawnDirectorExtra('runner');
           this.broadcast({ type: 'isolated-pressure', playerId: p.id });
         }
       }
     }
   }
+  // Director-extra spawn (tuning rounds 2026-11-17): in a Survival wave
+  // the extras are capped at waveExtraCap (wave 1: WAVE1_EXTRA_CAP = 3,
+  // waves 2+: the nominal wave count, set by startWave) — the wave's own
+  // spawn list is never capped, and BR passes straight through (cap is
+  // Infinity there). Returns false when the cap blocks the spawn (caller
+  // treats it as "pressure absorbed", not deferred — attention still
+  // resets so the surge does not re-fire).
+  spawnDirectorExtra(type) {
+    if (this.mode === 'survival' && this.phase === 'wave') {
+      if (this.waveExtras >= this.waveExtraCap) return false;
+      this.waveExtras++;
+    }
+    return this.spawnZombie(type);
+  }
   triggerSurge(reason) {
     this.director.surges++;
     this.director.lastSurgeTick = this.tickCount;
     const n = 4 + (this.mode === 'battle-royale' && this.zone ? this.zone.phase : this.wave);
-    for (let i = 0; i < n; i++) this.spawnZombie(Math.random() < 0.7 ? 'shambler' : 'runner');
-    this.broadcast({ type: 'surge', reason, count: n });
+    let spawned = 0;
+    for (let i = 0; i < n; i++) if (this.spawnDirectorExtra(Math.random() < 0.7 ? 'shambler' : 'runner')) spawned++;
+    this.broadcast({ type: 'surge', reason, count: spawned });
   }
 
   // ---- Player input (minimal protocol) ----
@@ -1413,7 +1501,7 @@ class Session {
   }
 
   downPlayer(p, attacker) {
-    p.hp = 0; p.state = 'downed'; p.downedTimerMs = DOWNED_SECONDS * 1000;
+    p.hp = 0; p.state = 'downed'; p.downedTimerMs = DOWNED_SECONDS * 1000; p.downedAtMs = this.nowMs;
     p.timesDowned++; p.reloadingWeapon = null;
     p.building = null; p.healing = null;
     if (attacker && attacker !== p) p.lastDamager = attacker; // owns the death if they bleed out / zombies finish them
@@ -1707,11 +1795,13 @@ class Session {
       if (z.culled && this.tickCount % 4 !== 0) continue;
       const stepMul = z.culled ? 4 : 1;
       const base = ZOMBIE_TYPES[z.type];
-      // Wave-1 groggy profile (see WAVE1_GROGGY): longer windups and
-      // fewer concurrent attackers while the session is in Survival wave 1.
-      const groggy = this.mode === 'survival' && this.wave === 1;
-      const windupMs = base.windup * 1000 * (groggy ? WAVE1_GROGGY.windupMul : 1);
-      const maxWindup = groggy ? WAVE1_GROGGY.maxWindup : 3;
+      // Groggy opening profile (see WAVE1_GROGGY / BR_OPENING_GROGGY):
+      // longer windups and fewer concurrent attackers while the session is
+      // in Survival wave 1 or BR zone phase 0.
+      const groggy = this.groggyNow();
+      const prof = this.mode === 'battle-royale' ? BR_OPENING_GROGGY : WAVE1_GROGGY;
+      const windupMs = base.windup * 1000 * (groggy ? prof.windupMul : 1);
+      const maxWindup = groggy ? prof.maxWindup : 3;
       // BR: a zombie outside the safe zone shambles toward the zone centre
       // and takes the same zone damage as a player — it dies if it stays
       // out too long. No zombie pile-up outside the circle.
@@ -1790,7 +1880,7 @@ class Session {
             // v7 fairness: at most 3 zombies wind up on one player at once —
             // the rest crowd around instead of deleting a full HP bar in one
             // volley (measured 100 -> 0 in ~5 s with 13+ in range).
-            // Wave-1 groggy: at most 2 (see WAVE1_GROGGY).
+            // Groggy opening: at most 2 (see WAVE1_GROGGY / BR_OPENING_GROGGY).
             if (z.state !== 'windup') {
               const windingUp = [...this.zombies.values()].filter(q => q !== z && q.state === 'windup' && q.attackTarget === tgt).length;
               if (windingUp < maxWindup) { z.state = 'windup'; z.windupUntil = this.nowMs + windupMs; z.attackTarget = tgt; }
@@ -1930,7 +2020,9 @@ class Session {
         const d = dist(tgt.x, tgt.y, z.x, z.y);
         if (d <= ZOMBIE_TYPES.brute.slamRadius && arena.hasLineOfSight(z.x, z.y, tgt.x, tgt.y)) {
           if (tgt.state === 'alive') this.damagePlayer(tgt, z.damage, null);
-          else if (tgt.state === 'downed') this.killPlayer(tgt, null, 'brute-slam');
+          // Same downed-execute grace as zombieAttack: no brute-slam finish
+          // inside the window (brutes don't appear in wave 1, but the rule is uniform).
+          else if (tgt.state === 'downed' && this.nowMs >= tgt.downedAtMs + DOWNED_EXECUTE_GRACE_MS) this.killPlayer(tgt, null, 'brute-slam');
         }
         z.state = 'chase'; z.attackTarget = null;
       }
@@ -1963,7 +2055,14 @@ class Session {
     z.state = 'chase'; z.attackTarget = null;
     if (!arena.hasLineOfSight(z.x, z.y, tgt.x, tgt.y)) return; // no through-wall
     if (this.nowMs < tgt.jumpUntil) return; // jumped the grab
-    if (tgt.state === 'downed') { this.killPlayer(tgt, null, 'zombie-execute'); return; }
+    // Downed-execute grace (tuning round 2026-11-17): a zombie that finishes
+    // its windup on a downed player inside the grace window does NOT execute
+    // — the windup is spent and the zombie goes back to chasing. A teammate
+    // gets the drive + hold time to revive; after the window, executes resume.
+    if (tgt.state === 'downed') {
+      if (this.nowMs < tgt.downedAtMs + DOWNED_EXECUTE_GRACE_MS) return;
+      this.killPlayer(tgt, null, 'zombie-execute'); return;
+    }
     if (tgt.state !== 'alive') return;
     if (this.nowMs < tgt.invulnUntil) return; // dodge i-frames
     // Bulwark: 40% less damage from the front (zombie inside facing 180 deg).
@@ -2020,11 +2119,25 @@ class Session {
       p.vx += clamp(targetVx.x - p.vx, -accel, accel);
       p.vy += clamp(targetVx.y - p.vy, -accel, accel);
       const oldX = p.x, oldY = p.y;
-      p.x += p.vx * TICK; p.y += p.vy * TICK;
-      p.x = clamp(p.x, arena.BOUNDS.minX, arena.BOUNDS.maxX);
-      p.y = clamp(p.y, arena.BOUNDS.minY, arena.BOUNDS.maxY);
-      const c = arena.resolveCollision(p.x, p.y, 0.4);
-      p.x = c.x; p.y = c.y;
+      // Substepped movement (r10d): a Scout Skydance dash moves up to
+      // ~1.19 tiles per tick, which tunnelled straight through a wall
+      // tile — resolveCollision only sees the endpoint, and a >0.5-tile
+      // penetration flipped the push direction inward, walking the
+      // player through the pond and out of bounds (x=-0.40). Moving in
+      // <=0.4-tile steps with clamp + collision after each one means no
+      // substep can cross a wall tile, so the push always sends the
+      // player back out the way they came in. Open-ground movement is
+      // unchanged (same total displacement); near a wall the player
+      // slides along it instead of tunnelling through it.
+      const mdx = p.vx * TICK, mdy = p.vy * TICK;
+      const steps = Math.max(1, Math.ceil(Math.max(Math.abs(mdx), Math.abs(mdy)) / 0.4));
+      for (let si = 0; si < steps; si++) {
+        p.x += mdx / steps; p.y += mdy / steps;
+        p.x = clamp(p.x, arena.BOUNDS.minX, arena.BOUNDS.maxX);
+        p.y = clamp(p.y, arena.BOUNDS.minY, arena.BOUNDS.maxY);
+        const c = arena.resolveCollision(p.x, p.y, 0.4);
+        p.x = c.x; p.y = c.y;
+      }
       // Movement validation: server-simulated position can never exceed
       // max speed; if it somehow does, clamp + log (anti-cheat floor).
       // Absolute cap 30 u/s: the fastest legal move is a Scout Skydance
@@ -2425,6 +2538,7 @@ if (require.main === module) {
 module.exports = {
   Session, WEAPONS, ZOMBIE_TYPES, ELITES, waveDef, waveCount, computeFlowField,
   arena, ZOMBIE_CAP, TICK_MS, GRACE_SECONDS, DOWNED_SECONDS, REVIVE_SECONDS,
+  DOWNED_EXECUTE_GRACE_MS, WAVE1_EXTRA_CAP,
   BREATHER_SECONDS, EXTRACTION_SECONDS, DISCONNECT_GRACE_MS, HIBERNATE_MS,
   sessions, makeCode, logAnomaly, anomalies,
   // Phase 2 exports (roles / progression / trust / squads / traps).

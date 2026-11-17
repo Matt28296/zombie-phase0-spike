@@ -12,6 +12,7 @@ const path = require('path');
 const {
   Session, WEAPONS, ZOMBIE_TYPES, waveDef, waveCount, computeFlowField,
   arena, ZOMBIE_CAP, TICK_MS, anomalies,
+  DOWNED_EXECUTE_GRACE_MS, WAVE1_EXTRA_CAP,
 } = require('./server');
 
 const PORT = 3001;
@@ -149,6 +150,123 @@ function unitTests() {
   addFake(br);
   tickN(br, 100);
   check('no spawns during breather', br.zombies.size === 0 && br.phase === 'breather');
+
+  console.log('\n--- unit: tuning round 2026-11-17 (grace / wave-1 cap / breather-0 second weapon) ---');
+  // Helper: a zombie on an orthogonal neighbour with clear LOS (same
+  // lesson as the r10 grace flake — a blind +1x can land inside a wall).
+  function zombieAdjacentLOS(s, type, p) {
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const zx = p.x + dx, zy = p.y + dy;
+      if (!arena.tileBlocked(Math.floor(zx), Math.floor(zy)) && arena.hasLineOfSight(zx, zy, p.x, p.y)) return zombieNear(s, type, zx, zy);
+    }
+    return null;
+  }
+  const gunsOf = p => p.weapons.filter(w => w !== 'melee');
+  check('downed-execute grace is 12 s (3 s drive + 6 s hold + 3 s margin, r9c)', DOWNED_EXECUTE_GRACE_MS === 12000, `${DOWNED_EXECUTE_GRACE_MS} ms`);
+  check('zombie does NOT execute a downed player inside the grace window', (() => {
+    const s = new Session('GR1');
+    const p = addFake(s);
+    s.downPlayer(p, null);
+    const z = zombieAdjacentLOS(s, 'shambler', p);
+    if (!z) return false;
+    s.zombieAttack(z, p, ZOMBIE_TYPES.shambler);
+    return p.state === 'downed';
+  })());
+  check('zombie DOES execute a downed player after the grace window', (() => {
+    const s = new Session('GR2');
+    const p = addFake(s);
+    s.downPlayer(p, null);
+    const z = zombieAdjacentLOS(s, 'shambler', p);
+    if (!z) return false;
+    s.nowMs += DOWNED_EXECUTE_GRACE_MS + 100;
+    s.zombieAttack(z, p, ZOMBIE_TYPES.shambler);
+    return p.state === 'dead';
+  })());
+  check('brute slam also respects the downed-execute grace window', (() => {
+    const s = new Session('GR3');
+    const p = addFake(s);
+    s.downPlayer(p, null);
+    // Brute in windup on the downed player, inside slam radius, windup done.
+    const z = zombieAdjacentLOS(s, 'brute', p);
+    if (!z) return false;
+    z.state = 'windup'; z.windupUntil = 0; z.attackTarget = p;
+    s.tick(); // slam resolution runs inside tick()
+    return p.state === 'downed';
+  })());
+  check('wave-1 director extras capped (noise surges cannot double wave 1)', (() => {
+    const s = new Session('W1C');
+    addFake(s); addFake(s);
+    tickN(s, 900); // past 45 s first breather -> wave 1
+    if (s.wave !== 1) return false;
+    // Attention 51, not 50: directorTick decays 0.03 before the >= 50
+    // noise check, so 50 exactly would never fire.
+    for (let i = 0; i < 10; i++) { s.director.attention = 51; s.directorTick(); }
+    // 10 forced noise surges would add 10 x (5 + 2) = 70 zombies uncapped;
+    // the cap must hold extras at exactly 3 and the wave at 3 spawned.
+    return s.waveExtras === WAVE1_EXTRA_CAP && s.zombies.size === WAVE1_EXTRA_CAP;
+  })(), `cap ${WAVE1_EXTRA_CAP}`);
+  check('wave-3 director extras capped at nominal (duo 35)', (() => {
+    const s = new Session('W3C');
+    addFake(s); addFake(s);
+    s.startWave(3);
+    if (s.waveExtraCap !== waveCount(3, 2) || s.waveExtraCap !== 35) return false;
+    for (let i = 0; i < 10; i++) { s.director.attention = 51; s.directorTick(); }
+    // 10 forced noise surges would add up to 10 x (7 + 2) = 90 uncapped
+    // (r10e measured ~71 in live play); the cap must hold extras at 35.
+    return s.waveExtras === 35 && s.zombies.size === 35;
+  })(), `cap ${waveCount(3, 2)}`);
+  check('wave-4 director extras capped at nominal (duo 43)', (() => {
+    const s = new Session('W4C');
+    addFake(s); addFake(s);
+    s.startWave(4);
+    if (s.waveExtraCap !== waveCount(4, 2) || s.waveExtraCap !== 43) return false;
+    // Direct choke-point forcing: the noise gate closes at zombies.size 40,
+    // so noise surges alone stall at 40 — force through spawnDirectorExtra
+    // (the single choke point, incl. the ungated isolated-pressure path).
+    let ok = true;
+    for (let i = 0; i < 100; i++) if (s.spawnDirectorExtra('shambler')) { if (s.waveExtras > 43) ok = false; }
+    return ok && s.waveExtras === 43 && s.zombies.size === 43 && s.spawnDirectorExtra('shambler') === false;
+  })(), `cap ${waveCount(4, 2)}`);
+  check('wave-4 extras never exceed the cap via the director path', (() => {
+    const s = new Session('W4D');
+    addFake(s); addFake(s);
+    s.startWave(4);
+    for (let i = 0; i < 10; i++) { s.director.attention = 51; s.directorTick(); }
+    return s.waveExtras <= 43 && s.zombies.size <= 43;
+  })());
+  check('BR director extras remain uncapped', (() => {
+    const s = new Session('BRU', { mode: 'battle-royale' });
+    addFake(s);
+    for (let i = 0; i < 50; i++) s.spawnDirectorExtra('shambler');
+    return s.waveExtras === 0 && s.zombies.size === 50;
+  })());
+  check('breather 0 grants a second weapon (shotgun) to every Survival player', (() => {
+    const s = new Session('GB0');
+    const a = addFake(s), b = addFake(s);
+    return gunsOf(a).length >= 2 && gunsOf(b).length >= 2 && gunsOf(a).includes('shotgun') && gunsOf(b).includes('shotgun');
+  })());
+  check('late joiner during breather 0 still gets the second weapon', (() => {
+    const s = new Session('GB1');
+    addFake(s);
+    const late = addFake(s);
+    return gunsOf(late).length >= 2 && gunsOf(late).includes('shotgun');
+  })());
+  check('role pick after the grant keeps the second weapon (sharpshooter keeps shotgun)', (() => {
+    const s = new Session('GB2');
+    const p = addFake(s);
+    s.setRole(p, 'sharpshooter');
+    return gunsOf(p).includes('rifle') && gunsOf(p).includes('shotgun') && p.currentWeapon === 'rifle';
+  })());
+  check('BR players get NO second weapon (melee-only drop-in)', (() => {
+    const s = new Session('GB3', { mode: 'battle-royale' });
+    const p = addFake(s);
+    return p.weapons.length === 1 && p.weapons[0] === 'melee';
+  })());
+  check('granted shotgun comes with a full mag + reserve', (() => {
+    const s = new Session('GB4');
+    const p = addFake(s);
+    return p.mag.shotgun === WEAPONS.shotgun.mag && p.ammo.shells >= WEAPONS.shotgun.reserveStart;
+  })());
 
   console.log('\n--- unit: lag compensation + headshots ---');
   const lag = new Session('LAG');

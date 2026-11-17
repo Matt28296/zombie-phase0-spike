@@ -50,6 +50,22 @@ function zombieNear(s, type, x, y) {
   s.zombies.set(z.id, z);
   return z;
 }
+// Place a zombie next to a player with a clear line of sight. The BR drop
+// point is shuffled, and br-7 (21.5, 22.5) has a WALL on its +x side — the
+// old blind `p.x + 1` placement put the zombie inside a blocked tile, and
+// zombieAttack correctly refuses a through-wall hit (LOS fails on the
+// zombie's own tile). With the BR-groggy 2.1 s windup only one attack
+// attempt fits in the 60-tick window, so that drop flaked ~1 run in 8.
+// Returns null when no orthogonal neighbour has LOS (loud setup failure,
+// never a silent pass).
+function zombieNearLOS(s, type, p) {
+  for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    const x = p.x + dx, y = p.y + dy;
+    if (!arena.tileBlocked(Math.floor(x), Math.floor(y)) && arena.hasLineOfSight(x, y, p.x, p.y))
+      return zombieNear(s, type, x, y);
+  }
+  return null;
+}
 function aimAt(from, to) {
   const dx = to.x - from.x, dy = to.y - from.y, l = Math.hypot(dx, dy) || 1;
   return { x: dx / l, y: dy / l };
@@ -142,8 +158,9 @@ function unitTests() {
   check('BR grace does NOT block zombie damage', (() => {
     const { s, ps } = brSession(1, false);
     const p = ps[0]; p.hp = 100;
-    zombieNear(s, 'shambler', p.x + 1, p.y);
-    tickN(s, 60); // 3 s: windup 0.6 s + attacks land
+    const z = zombieNearLOS(s, 'shambler', p);
+    if (!z) return false; // no LOS neighbour — test setup failure, not a pass
+    tickN(s, 60); // 3 s: BR-groggy windup 2.1 s + attack lands
     return p.hp < 100;
   })(), 'zombie hit a graced player');
 
@@ -196,10 +213,15 @@ function unitTests() {
       return { pile, before, weaponsAfter: [...v.weapons] };
     };
     const br = mkVictim('br'), sv = mkVictim('sv');
-    const same = JSON.stringify(br.pile.items.weapons) === JSON.stringify(sv.pile.items.weapons) &&
-      br.pile.items.meds === sv.pile.items.meds && br.pile.items.materials === sv.pile.items.materials;
-    return same && br.pile.items.weapons.includes('rifle') && br.pile.items.meds === 2 &&
-      JSON.stringify(br.before) === JSON.stringify(br.weaponsAfter); // victim keeps their list
+    // Same rule in both modes: carried meds/materials drop, equipped stays.
+    // The piles differ by design since the tuning round: the Survival victim
+    // starts with the breather-0 shotgun, so its pile holds shotgun + rifle;
+    // the BR victim (melee-only drop-in) holds rifle only.
+    const ruleHolds = r => r.pile.items.meds === 2 && r.pile.items.materials === 3 &&
+      JSON.stringify(r.before) === JSON.stringify(r.weaponsAfter);
+    return ruleHolds(br) && ruleHolds(sv) &&
+      JSON.stringify(br.pile.items.weapons) === JSON.stringify(['rifle']) &&
+      JSON.stringify(sv.pile.items.weapons) === JSON.stringify(['shotgun', 'rifle']);
   })());
   check('Survival has no ground loot', (() => {
     const s = new Session('M7'); addFake(s);
@@ -361,7 +383,10 @@ function unitTests() {
   console.log('\n--- unit: zombies and the zone (Job 3.3) ---');
   check('BR director spawns zombies INSIDE the current safe zone', (() => {
     const { s } = brSession(2);
-    tickN(s, 600); // 30 s of spawning
+    // 45 s of spawning: the BR-opening director is 1/6 s for the first 30 s
+    // (loot time), so 30 s only yields ~4 spawns and the >= 5 guard below
+    // would be drop-luck flaky (it also tripped on isolated-pressure spawns).
+    tickN(s, 900); // 45 s of spawning
     const z = s.zone.current;
     return s.zombies.size >= 5 && [...s.zombies.values()].every(zz => Math.hypot(zz.x - z.x, zz.y - z.y) <= z.r + 2);
   })());
