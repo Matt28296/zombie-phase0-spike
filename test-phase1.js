@@ -11,8 +11,9 @@ const { spawn } = require('child_process');
 const path = require('path');
 const {
   Session, WEAPONS, ZOMBIE_TYPES, waveDef, waveCount, computeFlowField,
-  arena, ZOMBIE_CAP, TICK_MS, anomalies,
+  arena, ZOMBIE_CAP, TICK_MS, anomalies, DOWNED_SECONDS,
   DOWNED_EXECUTE_GRACE_MS, WAVE1_EXTRA_CAP,
+  REVIVE_GRACE_PER_KILL_MS, REVIVE_GRACE_KILL_RADIUS, REVIVE_RALLY_HP_PER_KILL,
 } = require('./server');
 
 const PORT = 3001;
@@ -192,6 +193,154 @@ function unitTests() {
     z.state = 'windup'; z.windupUntil = 0; z.attackTarget = p;
     s.tick(); // slam resolution runs inside tick()
     return p.state === 'downed';
+  })());
+  // r10g 2026-11-17: grace stretches while a teammate clears the pile.
+  // r10f measured 7-11 zombies within 6 u at the down and a best
+  // close-range kill rate of 17 / 9.5 s = 0.56 s/kill — 9 kills to thin
+  // 11 -> 2 costs ~5-9 s + 3 s drive + 2 s hold = 10-14 s from the down,
+  // past the flat 12 s grace. Each pile kill buys 2 s.
+  check('grace extends 2 s per pile kill near a downed player', (() => {
+    const s = new Session('GX1');
+    const downed = addFake(s); const mate = addFake(s);
+    mate.x = downed.x + 3; mate.y = downed.y; // 3 u away, inside the 6 u pile radius
+    s.downPlayer(downed, null);
+    const before = downed.downedAtMs;
+    const z = zombieNear(s, 'shambler', downed.x + 1, downed.y);
+    if (!z) return false;
+    s.damageZombie(z, 999, mate);
+    return downed.downedAtMs === before + REVIVE_GRACE_PER_KILL_MS;
+  })(), `+${REVIVE_GRACE_PER_KILL_MS} ms`);
+  check('grace does NOT extend on a kill far from the downed player', (() => {
+    const s = new Session('GX2');
+    const downed = addFake(s); const mate = addFake(s);
+    mate.x = downed.x + 20; mate.y = downed.y; // 20 u away, outside the pile
+    s.downPlayer(downed, null);
+    const before = downed.downedAtMs;
+    const z = zombieNear(s, 'shambler', mate.x + 1, mate.y);
+    if (!z) return false;
+    s.damageZombie(z, 999, mate);
+    return downed.downedAtMs === before;
+  })());
+  check('zombie does NOT execute after the base grace when a pile kill extended it', (() => {
+    const s = new Session('GX3');
+    const downed = addFake(s); const mate = addFake(s);
+    mate.x = downed.x + 3; mate.y = downed.y;
+    s.downPlayer(downed, null);
+    const z1 = zombieNear(s, 'shambler', downed.x + 1, downed.y);
+    if (!z1) return false;
+    s.damageZombie(z1, 999, mate); // +2 s -> deadline now 14 s
+    const z2 = zombieAdjacentLOS(s, 'shambler', downed);
+    if (!z2) return false;
+    s.nowMs += DOWNED_EXECUTE_GRACE_MS + 100; // 12.1 s — past base, inside extended
+    s.zombieAttack(z2, downed, ZOMBIE_TYPES.shambler);
+    if (downed.state !== 'downed') return false;
+    s.nowMs += REVIVE_GRACE_PER_KILL_MS + 100; // 14.2 s — past extended
+    s.zombieAttack(z2, downed, ZOMBIE_TYPES.shambler);
+    return downed.state === 'dead';
+  })());
+  check('brute slam also respects the extended grace', (() => {
+    const s = new Session('GX4');
+    const downed = addFake(s); const mate = addFake(s);
+    mate.x = downed.x + 3; mate.y = downed.y;
+    s.downPlayer(downed, null);
+    const z1 = zombieNear(s, 'shambler', downed.x + 1, downed.y);
+    if (!z1) return false;
+    s.damageZombie(z1, 999, mate); // +2 s
+    const z = zombieAdjacentLOS(s, 'brute', downed);
+    if (!z) return false;
+    z.state = 'windup'; z.windupUntil = 0; z.attackTarget = downed;
+    s.nowMs += DOWNED_EXECUTE_GRACE_MS + 100; // past base, inside extended
+    s.tick();
+    return downed.state === 'downed';
+  })());
+  check('bleed-out still caps at 60 s despite pile-kill extensions', (() => {
+    const s = new Session('GX5');
+    const downed = addFake(s); const mate = addFake(s);
+    mate.x = downed.x + 3; mate.y = downed.y;
+    s.downPlayer(downed, null);
+    // Five pile kills buy 10 s of grace — the downed player must still
+    // bleed out at 60 s, not 70 s: the extension moves the execute
+    // deadline, never the bleed-out timer.
+    for (let i = 0; i < 5; i++) {
+      const z = zombieNear(s, 'shambler', downed.x + 1, downed.y);
+      if (!z) return false;
+      s.damageZombie(z, 999, mate);
+    }
+    if (downed.downedTimerMs !== DOWNED_SECONDS * 1000) return false;
+    tickN(s, 60 * 20); // 60 s of ticks (20 Hz)
+    return downed.state === 'dead';
+  })());
+  // r10h 2026-11-17: pile-kill rally — defending the body restores the
+  // defender. r10g2 measured the reviver at 25-28 HP at the down against a
+  // 2 s hold priced at 40-100, taking ~3 HP/s while clearing; the rally
+  // must return ~50 HP over the ~8 kills that thin 11 -> 3, hence 10/kill.
+  check('rally heals the killer 10 HP per pile kill near a downed player', (() => {
+    const s = new Session('RY1');
+    const downed = addFake(s); const mate = addFake(s);
+    mate.x = downed.x + 3; mate.y = downed.y; // inside the 6 u pile radius
+    mate.hp = 25; // r10g2's measured reviver HP at the down
+    s.downPlayer(downed, null);
+    const z = zombieNear(s, 'shambler', downed.x + 1, downed.y);
+    if (!z) return false;
+    s.damageZombie(z, 999, mate);
+    return mate.hp === 25 + REVIVE_RALLY_HP_PER_KILL;
+  })(), `+${REVIVE_RALLY_HP_PER_KILL} HP`);
+  check('rally does NOT fire on a kill far from the downed player', (() => {
+    const s = new Session('RY2');
+    const downed = addFake(s); const mate = addFake(s);
+    mate.x = downed.x + 20; mate.y = downed.y; // outside the pile
+    mate.hp = 25;
+    s.downPlayer(downed, null);
+    const z = zombieNear(s, 'shambler', mate.x + 1, mate.y);
+    if (!z) return false;
+    s.damageZombie(z, 999, mate);
+    return mate.hp === 25;
+  })());
+  check('rally caps at maxHp', (() => {
+    const s = new Session('RY3');
+    const downed = addFake(s); const mate = addFake(s);
+    mate.x = downed.x + 3; mate.y = downed.y;
+    mate.hp = mate.maxHp - 3;
+    s.downPlayer(downed, null);
+    const z = zombieNear(s, 'shambler', downed.x + 1, downed.y);
+    if (!z) return false;
+    s.damageZombie(z, 999, mate);
+    return mate.hp === mate.maxHp;
+  })());
+  check('rally fires once per kill even with two downed players nearby', (() => {
+    const s = new Session('RY4');
+    const downed1 = addFake(s); const downed2 = addFake(s); const mate = addFake(s);
+    downed2.x = downed1.x + 2; downed2.y = downed1.y;
+    mate.x = downed1.x + 3; mate.y = downed1.y; // within 6 u of both
+    mate.hp = 25;
+    s.downPlayer(downed1, null); s.downPlayer(downed2, null);
+    const z = zombieNear(s, 'shambler', downed1.x + 1, downed1.y);
+    if (!z) return false;
+    s.damageZombie(z, 999, mate);
+    return mate.hp === 25 + REVIVE_RALLY_HP_PER_KILL;
+  })());
+  check('rally does NOT heal the downed player', (() => {
+    const s = new Session('RY5');
+    const downed = addFake(s); const mate = addFake(s);
+    mate.x = downed.x + 3; mate.y = downed.y;
+    mate.hp = 25;
+    s.downPlayer(downed, null);
+    const z = zombieNear(s, 'shambler', downed.x + 1, downed.y);
+    if (!z) return false;
+    s.damageZombie(z, 999, mate);
+    return downed.hp === 0 && downed.state === 'downed';
+  })());
+  check('rally and grace extension fire on the same pile kill', (() => {
+    const s = new Session('RY6');
+    const downed = addFake(s); const mate = addFake(s);
+    mate.x = downed.x + 3; mate.y = downed.y;
+    mate.hp = 25;
+    s.downPlayer(downed, null);
+    const before = downed.downedAtMs;
+    const z = zombieNear(s, 'shambler', downed.x + 1, downed.y);
+    if (!z) return false;
+    s.damageZombie(z, 999, mate);
+    return downed.downedAtMs === before + REVIVE_GRACE_PER_KILL_MS && mate.hp === 25 + REVIVE_RALLY_HP_PER_KILL;
   })());
   check('wave-1 director extras capped (noise surges cannot double wave 1)', (() => {
     const s = new Session('W1C');
@@ -424,7 +573,11 @@ function unitTests() {
   check('execute by shooting a downed player kills them', (() => {
     const s = new Session('EX'); const a = addFake(s); const b = addFake(s);
     s.downPlayer(b, null);
-    a.x = b.x - 5; a.y = b.y; a.graceEndsAt = 0; b.graceEndsAt = 0;
+    // Explicit positions on open ground: plaza spawns rotate on the
+    // module-global player counter, so any test that adds players earlier
+    // in the run shifts which spawn this test's players get — b on
+    // spawn-6 puts a.x = b.x - 5 inside a wall and the shot misses.
+    a.x = 10; a.y = 30; b.x = 15; b.y = 30; a.graceEndsAt = 0; b.graceEndsAt = 0;
     const hit = s.shootAt(a, { x: 1, y: 0 }, s.nowMs);
     return !!hit && b.state === 'dead';
   })());
