@@ -342,6 +342,59 @@ function unitTests() {
     s.damageZombie(z, 999, mate);
     return downed.downedAtMs === before + REVIVE_GRACE_PER_KILL_MS && mate.hp === 25 + REVIVE_RALLY_HP_PER_KILL;
   })());
+  // r10h lever 2 2026-11-17: breather-2 sustain top-up (ammo + 1 med).
+  // Drive the wave-clear transition directly: wave N, phase 'wave',
+  // nothing left to spawn or alive -> one tick() clears into the breather.
+  function clearWaveIntoBreather(s, wave) {
+    s.wave = wave; s.phase = 'wave';
+    s.waveRemainingToSpawn = 0; s.spawnQueue = [];
+    s.zombies.clear();
+    s.tick();
+    return s.phase === 'breather';
+  }
+  check('breather-2 top-up adds reserveStart ammo to every owned gun', (() => {
+    const s = new Session('TP1');
+    const p = addFake(s);
+    s.grantWeapon(p, 'shotgun'); // own pistol + shotgun before the top-up
+    const pistolBefore = p.ammo.pistol, shellsBefore = p.ammo.shells;
+    if (!clearWaveIntoBreather(s, 2)) return false;
+    return p.ammo.pistol === pistolBefore + WEAPONS.pistol.reserveStart
+      && p.ammo.shells === shellsBefore + WEAPONS.shotgun.reserveStart;
+  })(), `+${WEAPONS.pistol.reserveStart} pistol / +${WEAPONS.shotgun.reserveStart} shells`);
+  check('breather-2 top-up grants +1 med, capped at maxMedsFor', (() => {
+    const s = new Session('TP2');
+    const p = addFake(s);
+    p.carried.meds = 1;
+    if (!clearWaveIntoBreather(s, 2)) return false;
+    if (p.carried.meds !== 2) return false;
+    const s2 = new Session('TP2b');
+    const q = addFake(s2);
+    q.carried.meds = s2.maxMedsFor(q); // at cap
+    if (!clearWaveIntoBreather(s2, 2)) return false;
+    return q.carried.meds === s2.maxMedsFor(q);
+  })());
+  check('no top-up at breather 1 or breather 3', (() => {
+    const s = new Session('TP3');
+    const p = addFake(s);
+    s.grantWeapon(p, 'shotgun');
+    const pistolBefore = p.ammo.pistol, medsBefore = p.carried.meds;
+    if (!clearWaveIntoBreather(s, 1)) return false;
+    if (p.ammo.pistol !== pistolBefore || p.carried.meds !== medsBefore) return false;
+    const s2 = new Session('TP3b');
+    const q = addFake(s2);
+    s2.grantWeapon(q, 'shotgun');
+    const pistolBefore2 = q.ammo.pistol, medsBefore2 = q.carried.meds;
+    if (!clearWaveIntoBreather(s2, 3)) return false;
+    return q.ammo.pistol === pistolBefore2 && q.carried.meds === medsBefore2;
+  })());
+  check('top-up never fires in BR (mode guard)', (() => {
+    const s = new Session('TP4', { mode: 'battle-royale' });
+    const p = addFake(s);
+    s.grantWeapon(p, 'shotgun');
+    const pistolBefore = p.ammo.pistol, medsBefore = p.carried.meds;
+    s.grantBreatherTopUp(p);
+    return p.ammo.pistol === pistolBefore && p.carried.meds === medsBefore;
+  })());
   check('wave-1 director extras capped (noise surges cannot double wave 1)', (() => {
     const s = new Session('W1C');
     addFake(s); addFake(s);

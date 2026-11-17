@@ -570,6 +570,25 @@ class Session {
     this.grantWeapon(p, second);
     this.broadcast({ type: 'second-weapon', playerId: p.id, weapon: second });
   }
+  // r10h lever 2 2026-11-17: breather-2 sustain top-up. r10g/r10h measured
+  // the downed player's partner going no-ammo on the primary at the
+  // critical moment (A no-ammo pistol in r10h run 2, B no-ammo pistol in
+  // r10h run 3, both pistols dry in r10g lever-1 run 1) — the pair's DPS
+  // collapses in wave 3 just as the pile peaks, so the pile is never
+  // thinned to a holdable size. Once, at the breather after wave 2, each
+  // living player tops up every owned gun by its reserveStart (via
+  // grantWeapon, the game's own ammo unit) and gains +1 med (capped).
+  // Meds alone were measured unspendable mid-wave (0 mid-wave heals in 6
+  // r10g runs), but B's r10h run-3 breather heals (14 -> 54 -> 94) show
+  // they are spent between waves — the top-up is for the wave-3 fight
+  // (ammo) and the breather after it (meds). Breather 2 only: wave 4+
+  // stays ammo-pressured, and it never fires in BR (no breather there).
+  grantBreatherTopUp(p) {
+    if (this.mode !== 'survival') return;
+    for (const w of [...p.weapons]) if (w !== 'melee') this.grantWeapon(p, w);
+    p.carried.meds = Math.min(this.maxMedsFor(p), p.carried.meds + 1);
+    this.broadcast({ type: 'breather-topup', playerId: p.id, wave: this.wave });
+  }
   // Loot multiplier: Leader aura (+5% loot, rounded up) + ammo perk (+25%).
   lootMult(p) {
     let m = 1;
@@ -2245,6 +2264,9 @@ class Session {
         }
         this.phase = 'breather';
         this.breatherEndsAt = this.nowMs + BREATHER_SECONDS * 1000;
+        // r10h lever 2: breather-2 sustain top-up (ammo + 1 med), once,
+        // for the wave-3 fight. See grantBreatherTopUp.
+        if (this.wave === 2) for (const p of this.alivePlayers()) this.grantBreatherTopUp(p);
         // Survive a wave together: each living player in a squad with at
         // least one other living squadmate gains +3 trust.
         for (const p of this.alivePlayers()) {
