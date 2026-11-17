@@ -166,6 +166,18 @@ function waveCount(n, playersAlive) {
   return Math.round(waveDef(n).count * (1 + 0.35 * Math.max(0, playersAlive - 1)));
 }
 
+// Wave-1 onboarding profile ("groggy" horde, Survival wave 1 only): the
+// first zombies are freshly risen — slower, weaker, longer windups, and
+// uncoordinated (fewer concurrent attackers), trickling in instead of
+// swarming. Measured 2026-11-16 (t5, live): with full stats a passive
+// solo player died at ~17 s into wave 1 (first damage ~11.5 s, then
+// ~3 attackers x 8 dmg / 0.65 s windup cycle). A single shambler at full
+// stats kills a stationary 100 HP player in ~8 s, so no count/speed/
+// pacing tweak alone can buy 30 s — the per-attacker DPS has to drop.
+// Target: passive solo player still alive at wave+30 s; a fighting player
+// still has 8 x 30 HP shamblers to kill. Waves 2+ use full stats.
+const WAVE1_GROGGY = { speedMul: 0.85, damageMul: 0.5, windupMul: 2.5, maxWindup: 2, spawnIntervalMs: 1500 };
+
 // ---- Battle Royale (Phase 3, spec §2.7; map scope: FULL Gate Town —
 // x 0..30, y 0..30, expanded 2026-11-16. Full 60x60-map BR is a
 // Phase 4 job.) ----
@@ -1081,10 +1093,15 @@ class Session {
       gx = t.x; gy = t.y;
     }
     // Minimum spawn distance from any player (fairness, §5.1).
+    // Wave-1 groggy profile (see WAVE1_GROGGY): freshly risen zombies
+    // are slower and weaker. Applies to every zombie spawned while the
+    // session is in Survival wave 1 (director spawns included); the
+    // stats are baked in at spawn, so wave-2 zombies are full strength.
+    const groggy = this.mode === 'survival' && this.wave === 1;
     const z = {
       id, type, elite, x: gx, y: gy, hp, maxHp: hp,
-      speed: base.speed * (affix ? affix.speedMul : 1),
-      damage: base.damage * (affix && affix.dmgMul ? affix.dmgMul : 1),
+      speed: base.speed * (affix ? affix.speedMul : 1) * (groggy ? WAVE1_GROGGY.speedMul : 1),
+      damage: base.damage * (affix && affix.dmgMul ? affix.dmgMul : 1) * (groggy ? WAVE1_GROGGY.damageMul : 1),
       state: 'chase', windupUntil: 0, attackTarget: null, screamUntil: 0, screamed: false,
       spitCdUntil: 0, zigPhase: Math.random() * Math.PI * 2, lastHitTick: -1,
       history: [], cullTick: 0, version: 0, look: Math.floor(Math.random() * 10),
@@ -1690,6 +1707,11 @@ class Session {
       if (z.culled && this.tickCount % 4 !== 0) continue;
       const stepMul = z.culled ? 4 : 1;
       const base = ZOMBIE_TYPES[z.type];
+      // Wave-1 groggy profile (see WAVE1_GROGGY): longer windups and
+      // fewer concurrent attackers while the session is in Survival wave 1.
+      const groggy = this.mode === 'survival' && this.wave === 1;
+      const windupMs = base.windup * 1000 * (groggy ? WAVE1_GROGGY.windupMul : 1);
+      const maxWindup = groggy ? WAVE1_GROGGY.maxWindup : 3;
       // BR: a zombie outside the safe zone shambles toward the zone centre
       // and takes the same zone damage as a player — it dies if it stays
       // out too long. No zombie pile-up outside the circle.
@@ -1725,7 +1747,7 @@ class Session {
       const lured = z.lureUntil && this.nowMs < z.lureUntil;
       const nearBarricade = !lured ? this.barricades.find(b => dist(z.x, z.y, b.x, b.y) <= 1.5) : null;
       if (nearBarricade) {
-        if (z.state !== 'windup') { z.state = 'windup'; z.windupUntil = this.nowMs + base.windup * 1000; z.attackTarget = { kind: 'barricade', barricade: nearBarricade }; }
+        if (z.state !== 'windup') { z.state = 'windup'; z.windupUntil = this.nowMs + windupMs; z.attackTarget = { kind: 'barricade', barricade: nearBarricade }; }
         else if (this.nowMs >= z.windupUntil) {
           z.state = 'chase'; z.attackTarget = null;
           nearBarricade.hp -= z.damage;
@@ -1746,7 +1768,7 @@ class Session {
           else if (d < base.holdRange - 2) this.moveZombieAway(z, tgt, base);
           else if (this.nowMs >= z.spitCdUntil && arena.hasLineOfSight(z.x, z.y, tgt.x, tgt.y)) {
             z.spitCdUntil = this.nowMs + 3000;
-            z.state = 'windup'; z.windupUntil = this.nowMs + base.windup * 1000;
+            z.state = 'windup'; z.windupUntil = this.nowMs + windupMs;
             z.attackTarget = { x: tgt.x, y: tgt.y, kind: 'pool' };
           }
         }
@@ -1768,9 +1790,10 @@ class Session {
             // v7 fairness: at most 3 zombies wind up on one player at once —
             // the rest crowd around instead of deleting a full HP bar in one
             // volley (measured 100 -> 0 in ~5 s with 13+ in range).
+            // Wave-1 groggy: at most 2 (see WAVE1_GROGGY).
             if (z.state !== 'windup') {
               const windingUp = [...this.zombies.values()].filter(q => q !== z && q.state === 'windup' && q.attackTarget === tgt).length;
-              if (windingUp < 3) { z.state = 'windup'; z.windupUntil = this.nowMs + base.windup * 1000; z.attackTarget = tgt; }
+              if (windingUp < maxWindup) { z.state = 'windup'; z.windupUntil = this.nowMs + windupMs; z.attackTarget = tgt; }
               else z.state = 'chase';
             }
             else if (this.nowMs >= z.windupUntil) this.zombieAttack(z, tgt, base);
@@ -2069,7 +2092,10 @@ class Session {
       this.startWave(this.wave + 1);
     } else if (this.phase === 'wave') {
       // Spawn pacing: interval shrinks with wave, director eases near wipe.
-      const interval = this.director.eased ? 1200 : Math.max(250, 800 - this.wave * 50);
+      // Wave 1 trickles in (see WAVE1_GROGGY) so the player sees them
+      // coming one by one instead of facing a pack.
+      const interval = this.director.eased ? 1200
+        : (this.mode === 'survival' && this.wave === 1 ? WAVE1_GROGGY.spawnIntervalMs : Math.max(250, 800 - this.wave * 50));
       this.spawnTimerMs += TICK_MS;
       if (this.waveRemainingToSpawn > 0 && this.spawnTimerMs >= interval) {
         this.spawnTimerMs = 0;
