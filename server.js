@@ -58,8 +58,7 @@ const GRACE_SECONDS = 10;         // spawn grace: no PvP damage, zombies can hur
 const DOWNED_SECONDS = 60;
 const DOWNED_EXECUTE_GRACE_MS = 12000; // tuning round 2026-11-17: zombies may not execute a downed player for 12 s after the down. Derived from r9c timings: 3 s drive (15 u at 5 u/s, a nearby teammate) + 6 s revive hold (harness-measured, r9c) + 3 s margin (snapshot lag + brief clear) = 12 s. Bleed-out stays 60 s, so a downed player with no teammate nearby still dies — downed is still dangerous, just no longer instantly fatal. PvP executes are NOT gated (deliberate player action, trust -30).
 const REVIVE_GRACE_PER_KILL_MS = 2000; // r10g 2026-11-17: each zombie a living teammate kills within 6 u of a downed player pushes that player's execute deadline out 2 s. Derived from r10f: a pile of 7-11 zombies within 6 u cannot be cleared to the <3 revive bar inside the 12 s grace (best observed close-range rate 17 kills / 9.5 s = 0.56 s/kill, so 9 kills to thin 11 -> 2 costs ~5-9 s + 3 s drive + 2 s hold = 10-14 s from the down). 2 s per pile kill keeps the deadline ahead of the clock while the partner is clearing effectively (net gain ~1-1.4 s per kill) and stalls when they are not. Both execute paths (zombieAttack and brute-slam) read downedAtMs + DOWNED_EXECUTE_GRACE_MS, so both slide together. Bleed-out (60 s) is untouched and stays the hard cap — kills buy time inside it, never past it.
-const REVIVE_GRACE_KILL_RADIUS = 6; // pile radius, same as the revive/heal safety bar — one radius, no new magic number.
-const REVIVE_RALLY_HP_PER_KILL = 10; // r10h 2026-11-17: defending the body also restores the defender. Derived from r10g2, not guessed: the reviver arrives at the body with 25-28 HP against a 2 s pile hold priced at 40-100, takes ~3 HP/s while clearing at close range (B: 25 -> 0 in ~8 s), and the pile needs ~8 kills to thin 11 -> 3 (best observed close-range rate 17 / 9.5 s). At a mid clear rate (~1 kill/s) 8 kills take ~8 s and cost ~24 HP of incoming damage, and the hold itself costs ~15-27 once the pile is thinned to 3 — so the clear must return ~50 HP: 10 HP/kill over 8 kills is 80 HP, which covers the mid case (25 - 24 + 80 = 81) and the slow clear (~0.5 kills/s, ~16 s, ~48 damage: 25 - 48 + 80 = 57 > 27). Two medkits' worth (40 HP each) per pile cleared, earned only while a teammate is downed and the killer is inside the pile radius. Capped at maxHp; no effect when nobody is downed, so wave balance is untouched.
+const REVIVE_RALLY_HP_PER_KILL = 10; // r10h 2026-11-17: defending the body also restores the defender. Derived from r10g2, not guessed: the reviver arrives at the body with 25-28 HP against a 2 s pile hold priced at 40-100, takes ~3 HP/s while clearing at close range (B: 25 -> 0 in ~8 s), and the pile needs ~8 kills to thin 11 -> 3 (best observed close-range rate 17 / 9.5 s). At a mid clear rate (~1 kill/s) 8 kills take ~8 s and cost ~24 HP of incoming damage, and the hold itself costs ~15-27 once the pile is thinned to 3 — so the clear must return ~50 HP: 10 HP/kill over 8 kills is 80 HP, which covers the mid case (25 - 24 + 80 = 81) and the slow clear (~0.5 kills/s, ~16 s, ~48 damage: 25 - 48 + 80 = 57 > 27). Two medkits' worth (40 HP each) per pile cleared, earned only while a teammate is downed. Capped at maxHp; no effect when nobody is downed, so wave balance is untouched. r10i: the pile-radius gate is gone (see damageZombie) — the rally now pays on any kill while a teammate is downed, at any distance; the per-kill value is unchanged.
 const WAVE1_EXTRA_CAP = 3; // tuning round 2026-11-17: director extras (noise surges, isolated pressure) in Survival wave 1 are capped at 3, so total wave-1 spawns stay ≤ nominal + 3 (14 for 2 players, 11 solo). r9c measured 21–39 zombies vs 11 nominal when two players shoot.
 const REVIVE_SECONDS = 3;
 const DISCONNECT_GRACE_MS = 30 * 1000;
@@ -1462,19 +1461,26 @@ class Session {
       this.score.kills++;
       if (shooter) {
         shooter.kills++;
-        // r10g: defending the body buys time. A kill within 6 u of a downed
-        // player pushes that player's execute deadline out by
-        // REVIVE_GRACE_PER_KILL_MS — the partner is actively clearing the
-        // pile, so the grace stretches while the clearing does. The
-        // downed player's bleed-out timer is untouched: kills buy time
-        // inside the 60 s window, never past it.
-        // r10h rally: a pile kill also restores the defender — one heal per
-        // kill even if two teammates are downed nearby (the flag, not the
-        // loop count, decides it). The grace extension buys the downed
-        // player time; the rally buys the reviver the HP to use it.
+        // r10g: defending the body buys time. A kill while a teammate is
+        // downed pushes that player's execute deadline out by
+        // REVIVE_GRACE_PER_KILL_MS — the partner is actively fighting, so
+        // the grace stretches while the fighting does. The downed
+        // player's bleed-out timer is untouched: kills buy time inside
+        // the 60 s window, never past it.
+        // r10h rally: a kill while a teammate is downed also restores the
+        // killer — one heal per kill even if two teammates are downed
+        // (the flag, not the loop count, decides it). The grace extension
+        // buys the downed player time; the rally buys the reviver the HP
+        // to use it.
+        // r10i: BOTH radii are gone. The 6 u pile radius never fired in
+        // live play (r10h: 0 rally payouts in 6 runs; the partner fights
+        // at range, and going into the pile is what gets them mauled at
+        // 7-23 HP/s). Any kill by a living teammate while a teammate is
+        // downed pays both rewards, at any distance. No new constants:
+        // the per-kill values are unchanged, only the gate is removed.
         let rally = false;
         for (const q of this.players.values()) {
-          if (q.state === 'downed' && dist(shooter.x, shooter.y, q.x, q.y) <= REVIVE_GRACE_KILL_RADIUS) {
+          if (q.state === 'downed') {
             q.downedAtMs += REVIVE_GRACE_PER_KILL_MS;
             rally = true;
           }
@@ -2581,7 +2587,7 @@ if (require.main === module) {
 module.exports = {
   Session, WEAPONS, ZOMBIE_TYPES, ELITES, waveDef, waveCount, computeFlowField,
   arena, ZOMBIE_CAP, TICK_MS, GRACE_SECONDS, DOWNED_SECONDS, REVIVE_SECONDS,
-  DOWNED_EXECUTE_GRACE_MS, WAVE1_EXTRA_CAP, REVIVE_GRACE_PER_KILL_MS, REVIVE_GRACE_KILL_RADIUS, REVIVE_RALLY_HP_PER_KILL,
+  DOWNED_EXECUTE_GRACE_MS, WAVE1_EXTRA_CAP, REVIVE_GRACE_PER_KILL_MS, REVIVE_RALLY_HP_PER_KILL,
   BREATHER_SECONDS, EXTRACTION_SECONDS, DISCONNECT_GRACE_MS, HIBERNATE_MS,
   sessions, makeCode, logAnomaly, anomalies,
   // Phase 2 exports (roles / progression / trust / squads / traps).

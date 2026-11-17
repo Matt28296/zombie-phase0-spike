@@ -13,7 +13,7 @@ const {
   Session, WEAPONS, ZOMBIE_TYPES, waveDef, waveCount, computeFlowField,
   arena, ZOMBIE_CAP, TICK_MS, anomalies, DOWNED_SECONDS,
   DOWNED_EXECUTE_GRACE_MS, WAVE1_EXTRA_CAP,
-  REVIVE_GRACE_PER_KILL_MS, REVIVE_GRACE_KILL_RADIUS, REVIVE_RALLY_HP_PER_KILL,
+  REVIVE_GRACE_PER_KILL_MS, REVIVE_RALLY_HP_PER_KILL,
 } = require('./server');
 
 const PORT = 3001;
@@ -199,10 +199,10 @@ function unitTests() {
   // close-range kill rate of 17 / 9.5 s = 0.56 s/kill — 9 kills to thin
   // 11 -> 2 costs ~5-9 s + 3 s drive + 2 s hold = 10-14 s from the down,
   // past the flat 12 s grace. Each pile kill buys 2 s.
-  check('grace extends 2 s per pile kill near a downed player', (() => {
+  check('grace extends 2 s per kill while a teammate is downed', (() => {
     const s = new Session('GX1');
     const downed = addFake(s); const mate = addFake(s);
-    mate.x = downed.x + 3; mate.y = downed.y; // 3 u away, inside the 6 u pile radius
+    mate.x = downed.x + 3; mate.y = downed.y; // 3 u away, near the body
     s.downPlayer(downed, null);
     const before = downed.downedAtMs;
     const z = zombieNear(s, 'shambler', downed.x + 1, downed.y);
@@ -210,16 +210,43 @@ function unitTests() {
     s.damageZombie(z, 999, mate);
     return downed.downedAtMs === before + REVIVE_GRACE_PER_KILL_MS;
   })(), `+${REVIVE_GRACE_PER_KILL_MS} ms`);
-  check('grace does NOT extend on a kill far from the downed player', (() => {
+  // r10i: the 6 u pile radius is gone — a kill at range pays the same as
+  // a pile kill (r10h: 0 rally payouts in 6 runs because the partner
+  // fights at range). Both rewards fire on any kill while a teammate
+  // is downed, at any distance.
+  check('grace DOES extend on a kill far from the downed player', (() => {
     const s = new Session('GX2');
     const downed = addFake(s); const mate = addFake(s);
-    mate.x = downed.x + 20; mate.y = downed.y; // 20 u away, outside the pile
+    mate.x = downed.x + 20; mate.y = downed.y; // 20 u away, at range
     s.downPlayer(downed, null);
     const before = downed.downedAtMs;
     const z = zombieNear(s, 'shambler', mate.x + 1, mate.y);
     if (!z) return false;
     s.damageZombie(z, 999, mate);
-    return downed.downedAtMs === before;
+    return downed.downedAtMs === before + REVIVE_GRACE_PER_KILL_MS;
+  })());
+  check('grace extends for EVERY downed player on one kill', (() => {
+    const s = new Session('GX2b');
+    const downed1 = addFake(s); const downed2 = addFake(s); const mate = addFake(s);
+    downed2.x = downed1.x + 15; downed2.y = downed1.y; // far apart, both downed
+    mate.x = downed1.x + 20; mate.y = downed1.y;
+    s.downPlayer(downed1, null); s.downPlayer(downed2, null);
+    const b1 = downed1.downedAtMs, b2 = downed2.downedAtMs;
+    const z = zombieNear(s, 'shambler', mate.x + 1, mate.y);
+    if (!z) return false;
+    s.damageZombie(z, 999, mate);
+    return downed1.downedAtMs === b1 + REVIVE_GRACE_PER_KILL_MS &&
+      downed2.downedAtMs === b2 + REVIVE_GRACE_PER_KILL_MS;
+  })());
+  check('no grace extension or rally when nobody is downed', (() => {
+    const s = new Session('GX2c');
+    const mate = addFake(s); const other = addFake(s);
+    mate.x = other.x + 20; mate.y = other.y;
+    mate.hp = 25;
+    const z = zombieNear(s, 'shambler', mate.x + 1, mate.y);
+    if (!z) return false;
+    s.damageZombie(z, 999, mate);
+    return mate.hp === 25; // rally needs a downed teammate; nothing pays out
   })());
   check('zombie does NOT execute after the base grace when a pile kill extended it', (() => {
     const s = new Session('GX3');
@@ -258,7 +285,7 @@ function unitTests() {
     const downed = addFake(s); const mate = addFake(s);
     mate.x = downed.x + 3; mate.y = downed.y;
     s.downPlayer(downed, null);
-    // Five pile kills buy 10 s of grace — the downed player must still
+    // Five kills buy 10 s of grace — the downed player must still
     // bleed out at 60 s, not 70 s: the extension moves the execute
     // deadline, never the bleed-out timer.
     for (let i = 0; i < 5; i++) {
@@ -274,10 +301,10 @@ function unitTests() {
   // defender. r10g2 measured the reviver at 25-28 HP at the down against a
   // 2 s hold priced at 40-100, taking ~3 HP/s while clearing; the rally
   // must return ~50 HP over the ~8 kills that thin 11 -> 3, hence 10/kill.
-  check('rally heals the killer 10 HP per pile kill near a downed player', (() => {
+  check('rally heals the killer 10 HP per kill while a teammate is downed', (() => {
     const s = new Session('RY1');
     const downed = addFake(s); const mate = addFake(s);
-    mate.x = downed.x + 3; mate.y = downed.y; // inside the 6 u pile radius
+    mate.x = downed.x + 3; mate.y = downed.y; // near the body
     mate.hp = 25; // r10g2's measured reviver HP at the down
     s.downPlayer(downed, null);
     const z = zombieNear(s, 'shambler', downed.x + 1, downed.y);
@@ -285,16 +312,16 @@ function unitTests() {
     s.damageZombie(z, 999, mate);
     return mate.hp === 25 + REVIVE_RALLY_HP_PER_KILL;
   })(), `+${REVIVE_RALLY_HP_PER_KILL} HP`);
-  check('rally does NOT fire on a kill far from the downed player', (() => {
+  check('rally DOES fire on a kill far from the downed player', (() => {
     const s = new Session('RY2');
     const downed = addFake(s); const mate = addFake(s);
-    mate.x = downed.x + 20; mate.y = downed.y; // outside the pile
+    mate.x = downed.x + 20; mate.y = downed.y; // at range — r10i widened
     mate.hp = 25;
     s.downPlayer(downed, null);
     const z = zombieNear(s, 'shambler', mate.x + 1, mate.y);
     if (!z) return false;
     s.damageZombie(z, 999, mate);
-    return mate.hp === 25;
+    return mate.hp === 25 + REVIVE_RALLY_HP_PER_KILL;
   })());
   check('rally caps at maxHp', (() => {
     const s = new Session('RY3');
@@ -307,14 +334,14 @@ function unitTests() {
     s.damageZombie(z, 999, mate);
     return mate.hp === mate.maxHp;
   })());
-  check('rally fires once per kill even with two downed players nearby', (() => {
+  check('rally fires once per kill even with two downed players, killer at range', (() => {
     const s = new Session('RY4');
     const downed1 = addFake(s); const downed2 = addFake(s); const mate = addFake(s);
     downed2.x = downed1.x + 2; downed2.y = downed1.y;
-    mate.x = downed1.x + 3; mate.y = downed1.y; // within 6 u of both
+    mate.x = downed1.x + 20; mate.y = downed1.y; // at range from both
     mate.hp = 25;
     s.downPlayer(downed1, null); s.downPlayer(downed2, null);
-    const z = zombieNear(s, 'shambler', downed1.x + 1, downed1.y);
+    const z = zombieNear(s, 'shambler', mate.x + 1, mate.y);
     if (!z) return false;
     s.damageZombie(z, 999, mate);
     return mate.hp === 25 + REVIVE_RALLY_HP_PER_KILL;
@@ -330,14 +357,14 @@ function unitTests() {
     s.damageZombie(z, 999, mate);
     return downed.hp === 0 && downed.state === 'downed';
   })());
-  check('rally and grace extension fire on the same pile kill', (() => {
+  check('rally and grace extension fire on the same kill at range', (() => {
     const s = new Session('RY6');
     const downed = addFake(s); const mate = addFake(s);
-    mate.x = downed.x + 3; mate.y = downed.y;
+    mate.x = downed.x + 20; mate.y = downed.y; // at range
     mate.hp = 25;
     s.downPlayer(downed, null);
     const before = downed.downedAtMs;
-    const z = zombieNear(s, 'shambler', downed.x + 1, downed.y);
+    const z = zombieNear(s, 'shambler', mate.x + 1, mate.y);
     if (!z) return false;
     s.damageZombie(z, 999, mate);
     return downed.downedAtMs === before + REVIVE_GRACE_PER_KILL_MS && mate.hp === 25 + REVIVE_RALLY_HP_PER_KILL;
