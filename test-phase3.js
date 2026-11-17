@@ -503,6 +503,53 @@ function unitTests() {
     tickN(s, 100);
     return !s.ended;
   })());
+  check('REGRESSION (Round 2, 15:11 bogus br-win): lone 2-player squad does NOT end the match when a member is downed — downed player is revivable, nobody eliminated', (() => {
+    const { s, ps } = brSession(2, false);
+    const [a, b] = ps;
+    s.inviteSquad(a, b.id); s.acceptSquad(b, a.id);
+    s.spawnTimerMs = -100000; // suppress director spawns for this window
+    // Wipe any surge/pressure spawns each tick: this test is about the win
+    // check, not zombie finishes (same pattern as the revivable-squadmate test).
+    for (let i = 0; i < 2; i++) { s.tick(); s.zombies.clear(); }
+    if (s.ended) return false; // forming the squad alone must not win (15:11)
+    s.downPlayer(a, null); // zombie downs A; B stands ready to revive
+    for (let i = 0; i < 2; i++) { s.tick(); s.zombies.clear(); }
+    return !s.ended && a.state === 'downed' && b.state === 'alive';
+  })());
+  check('REGRESSION (Round 2): downed squadmate revived, match continues until a real elimination, then the squad wins', (() => {
+    const { s, ps } = brSession(3, false);
+    const [a, b, c] = ps;
+    s.inviteSquad(a, b.id); s.acceptSquad(b, a.id);
+    s.spawnTimerMs = -100000;
+    s.downPlayer(a, null);
+    s.tick(); s.zombies.clear();
+    if (s.ended) return false;
+    b.interactHeld = true; b.x = a.x; b.y = a.y;
+    for (let i = 0; i < 70; i++) { s.tick(); s.zombies.clear(); } // 3.5 s: revive channel completes
+    b.interactHeld = false;
+    if (a.state !== 'alive') return false;
+    s.killPlayer(c, a, 'executed'); // the only real elimination: C dies
+    tickN(s, 2);
+    return s.ended && s.endReason === 'br-win' && s.brWinners.includes(a.id) && s.brWinners.includes(b.id);
+  })());
+  check('REGRESSION (Round 2): downed solo revived cross-squad, then a merge — the stale elimination must not linger, match ends only on the real elimination', (() => {
+    const { s, ps } = brSession(3, false);
+    const [a, b, c] = ps;
+    s.spawnTimerMs = -100000;
+    s.downPlayer(a, null); // A downed as a solo; C keeps the match alive
+    s.tick(); s.zombies.clear();
+    if (s.ended) return false;
+    b.interactHeld = true; b.x = a.x; b.y = a.y;
+    for (let i = 0; i < 70; i++) { s.tick(); s.zombies.clear(); } // B revives A (cross-squad) — clears the elimination
+    b.interactHeld = false;
+    if (a.state !== 'alive') return false;
+    s.inviteSquad(a, b.id); s.acceptSquad(b, a.id); // merge AFTER the revive
+    for (let i = 0; i < 100; i++) { s.tick(); s.zombies.clear(); }
+    if (s.ended) return false; // C still alive as a separate unit: no win
+    s.killPlayer(c, a, 'executed'); // real elimination: C dies
+    tickN(s, 2);
+    return s.ended && s.endReason === 'br-win' && s.brWinners.length === 2;
+  })());
 
   console.log('\n--- unit: BR end screen (Job 3.4) ---');
   check('BR end screen carries every field (placement, kills, headshots, playersKilled, revives, damage, loot, survival, zones, titles)', (() => {

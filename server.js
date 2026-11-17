@@ -396,6 +396,7 @@ class Session {
     this.zone = null; // {phase, current:{x,y,r}, next:{x,y,r}|null, state, phaseEndsAt, shrinkEndsAt, shrinkFrom, shrinkTo, dps}
     this.groundLoot = []; // BR fixed ground spawns (copies of BR_GROUND_LOOT, taken:false)
     this.brWinners = null; // [playerIds] set when the BR win is detected
+    this.brEliminatedUnits = new Set(); // BR unit keys (squadId or `solo:<id>`) eliminated so far — a unit is eliminated when its last standing member dies or goes down with no living squadmate. A win needs >= 1 elimination still in effect (a revive removes the key). A merge is never an elimination.
     this.peakPlayers = 0; // most players ever in the session (BR win needs >= 2)
     this.brStartedAt = 0; // session-clock ms when the BR zone started (v7: slow phase-0 director for the first 30 s)
     this.brDropOrder = null; // shuffled BR_DROP_POINTS, assigned in join order
@@ -972,25 +973,51 @@ class Session {
     }
     return null;
   }
-  // Last-standing win detection. A player counts as standing if alive, or
-  // downed with a living squadmate who could still revive them. A downed
-  // player whose squadmates are all dead is effectively dead — the match
-  // ends without waiting for their bleed-out timer.
+  // A player counts as standing if alive, or downed with a living squadmate
+  // who could still revive them. A downed player whose squadmates are all
+  // dead is effectively dead — the match ends without waiting for their
+  // bleed-out timer. (One definition, shared by checkBRWin and the
+  // elimination tracker, so the two can never drift apart.)
+  isStanding(p) {
+    if (p.state === 'alive') return true;
+    if (p.state !== 'downed') return false;
+    return [...this.players.values()].some(q => q !== p && q.state === 'alive' && q.squadId && q.squadId === p.squadId);
+  }
+  unitKey(p) { return p.squadId || `solo:${p.id}`; }
+  // After a player stops standing, remember the elimination if their unit
+  // has no standing member left. Called from downPlayer/killPlayer — the
+  // only two paths into 'downed'/'dead'. A squad forming or merging never
+  // records one: a merge is not an elimination.
+  noteUnitLoss(p) {
+    if (this.mode !== 'battle-royale' || this.ended) return;
+    const key = this.unitKey(p);
+    const survives = [...this.players.values()].some(q => q !== p && this.isStanding(q) && this.unitKey(q) === key);
+    if (!survives) this.brEliminatedUnits.add(key);
+  }
+  // A revived player puts their unit back on its feet: it is no longer
+  // eliminated. (Also clears the solo key — a player downed as a solo who
+  // joined a squad mid-bleedout comes back under the squad key.)
+  noteUnitReturn(p) {
+    if (this.mode !== 'battle-royale') return;
+    this.brEliminatedUnits.delete(this.unitKey(p));
+    this.brEliminatedUnits.delete(`solo:${p.id}`);
+  }
+  // Last-standing win detection.
   checkBRWin() {
     if (this.mode !== 'battle-royale' || this.ended || this.peakPlayers < 2) return;
     if (!this.connectedPlayers().length) return; // all disconnected: hibernate, don't crown
-    const standing = (p) => p.state === 'alive' ||
-      (p.state === 'downed' && [...this.players.values()].some(q => q !== p && q.state === 'alive' && q.squadId && q.squadId === p.squadId));
-    const alive = [...this.players.values()].filter(standing);
+    const alive = [...this.players.values()].filter(p => this.isStanding(p));
     if (!alive.length) { this.endSession('wipe'); return; }
-    const units = new Set(alive.map(p => p.squadId || `solo:${p.id}`));
-    // v7: a win needs combat to have happened — two friends forming a squad
-    // in an otherwise empty lobby won instantly (1 unit, 0 downs/deaths).
-    // Units only legitimately drop to 1 by elimination (downed or dead),
-    // not by merging. A downed player with a living squadmate still counts
-    // as standing, so a revivable squadmate never triggers this alone.
-    const combatHappened = this.deathSeq > 0 || [...this.players.values()].some(p => p.timesDowned > 0);
-    if (units.size === 1 && combatHappened) {
+    const units = new Set(alive.map(p => this.unitKey(p)));
+    // Round 2 fix: a win needs an actual ELIMINATION — a unit that was
+    // standing and is now gone — not merely a prior down. The old
+    // combatHappened guard (any player ever downed) fired the instant the
+    // first member of a lone 2-player squad went down, even though the
+    // downed player was still standing (revivable squadmate) and nobody
+    // had been eliminated — the 15:11 bogus br-win, one down later. A
+    // squad forming in an empty lobby wins nothing; a merge is not an
+    // elimination.
+    if (units.size === 1 && this.brEliminatedUnits.size > 0) {
       this.brWinners = alive.map(p => p.id);
       this.endSession('br-win');
     }
@@ -1375,6 +1402,7 @@ class Session {
     if (attacker && attacker !== p) p.lastDamager = attacker; // owns the death if they bleed out / zombies finish them
     this.broadcast({ type: 'player-downed', playerId: p.id, by: attacker ? attacker.id : null });
     this.squadFeed('down', { playerId: p.id, by: attacker ? attacker.id : null });
+    this.noteUnitLoss(p);
   }
 
   killPlayer(p, killer, cause) {
@@ -1415,6 +1443,7 @@ class Session {
     p.carried = { meds: 0, materials: 0 };
     p.lastDamager = null;
     this.broadcast({ type: 'player-died', playerId: p.id, by: effKiller ? effKiller.id : null, cause });
+    this.noteUnitLoss(p);
     this.checkWipe();
   }
 
@@ -1502,6 +1531,7 @@ class Session {
       if (p.reviveProgressMs >= p.reviveNeededMs) {
         target.state = 'alive'; target.hp = Math.round(target.maxHp * 0.5);
         target.downedTimerMs = 0; target.lastDamager = null; p.revives++; p.reviveTarget = null; p.reviveProgressMs = 0;
+        this.noteUnitReturn(target); // unit is standing again: not eliminated
         // Trust: +8 for a revive, +12 for a cross-squad revive (different
         // squads, or reviving a squad member while solo — same squad is +8).
         const cross = !(p.squadId && target.squadId && p.squadId === target.squadId);
